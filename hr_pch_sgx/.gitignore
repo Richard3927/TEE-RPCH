@@ -1,0 +1,14 @@
+/.config_*
+/app
+/enclave.so
+/enclave.signed.so
+/build/
+/App/Enclave_u.c
+/App/Enclave_u.h
+/Enclave/Enclave_t.c
+/Enclave/Enclave_t.h
+/Enclave/Enclave_private_test.pem
+/artifacts/*.json
+/artifacts/*.svg
+/artifacts/*.md
+

@@ -1,0 +1,2972 @@
+#include "Enclave_u.h"
+
+#include <ABE/CP_ABE.h>
+#include <ABE/FAME-OD.h>
+#include <RSA/RSA.h>
+#include <SE/AES.h>
+#include <curve/params.h>
+#include <utils/func.h>
+
+#include <pbc/pbc.h>
+
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <openssl/x509.h>
+
+#include <sgx_urts.h>
+
+#include <atomic>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+extern "C" void ocall_print_string(const char* str) {
+    if (str == nullptr) return;
+    std::fputs(str, stdout);
+    std::fflush(stdout);
+}
+
+// --------------------- helpers ---------------------
+static uint64_t now_us() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()).count());
+}
+
+static const char* kDloVersion = "dlo-pch-v5";
+
+static size_t mpz_bytes(const mpz_t v) {
+    return (mpz_sizeinbase(v, 2) + 7) / 8;
+}
+
+static std::vector<uint8_t> mpz_to_bytes(const mpz_t v) {
+    size_t out_len = 0;
+    void* ptr = mpz_export(nullptr, &out_len, 1, 1, 0, 0, v);
+    std::vector<uint8_t> out;
+    if (out_len == 0) {
+        return out;
+    }
+    out.assign(static_cast<uint8_t*>(ptr), static_cast<uint8_t*>(ptr) + out_len);
+    std::free(ptr);
+    return out;
+}
+
+static std::vector<uint8_t> mpz_to_bytes_nonempty(const mpz_t v) {
+    std::vector<uint8_t> out = mpz_to_bytes(v);
+    if (out.empty()) {
+        out.push_back(0);
+    }
+    return out;
+}
+
+static void mpz_from_bytes(mpz_t out, const uint8_t* buf, size_t len) {
+    mpz_import(out, len, 1, 1, 0, 0, buf);
+}
+
+static std::vector<uint8_t> sha256_bytes(const uint8_t* data, size_t len) {
+    std::vector<uint8_t> out(SHA256_DIGEST_LENGTH);
+    SHA256(data, len, out.data());
+    return out;
+}
+
+static std::vector<uint8_t> sha256_concat(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    SHA256_CTX sha;
+    SHA256_Init(&sha);
+    SHA256_Update(&sha, a.data(), a.size());
+    SHA256_Update(&sha, b.data(), b.size());
+    std::vector<uint8_t> out(SHA256_DIGEST_LENGTH);
+    SHA256_Final(out.data(), &sha);
+    return out;
+}
+
+static std::vector<uint8_t> concat(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    std::vector<uint8_t> out;
+    out.reserve(a.size() + b.size());
+    out.insert(out.end(), a.begin(), a.end());
+    out.insert(out.end(), b.begin(), b.end());
+    return out;
+}
+
+using Hash32 = std::array<uint8_t, 32>;
+
+static void u64_to_be(uint64_t v, uint8_t out[8]) {
+    out[0] = static_cast<uint8_t>((v >> 56) & 0xff);
+    out[1] = static_cast<uint8_t>((v >> 48) & 0xff);
+    out[2] = static_cast<uint8_t>((v >> 40) & 0xff);
+    out[3] = static_cast<uint8_t>((v >> 32) & 0xff);
+    out[4] = static_cast<uint8_t>((v >> 24) & 0xff);
+    out[5] = static_cast<uint8_t>((v >> 16) & 0xff);
+    out[6] = static_cast<uint8_t>((v >> 8) & 0xff);
+    out[7] = static_cast<uint8_t>(v & 0xff);
+}
+
+static void u32_to_be(uint32_t v, uint8_t out[4]) {
+    out[0] = static_cast<uint8_t>((v >> 24) & 0xff);
+    out[1] = static_cast<uint8_t>((v >> 16) & 0xff);
+    out[2] = static_cast<uint8_t>((v >> 8) & 0xff);
+    out[3] = static_cast<uint8_t>(v & 0xff);
+}
+
+static std::vector<uint8_t> pack_two_mpz(const mpz_t a, const mpz_t b) {
+    const std::vector<uint8_t> a_bytes = mpz_to_bytes_nonempty(a);
+    const std::vector<uint8_t> b_bytes = mpz_to_bytes_nonempty(b);
+    std::vector<uint8_t> out;
+    out.resize(4 + a_bytes.size() + 4 + b_bytes.size());
+    u32_to_be(static_cast<uint32_t>(a_bytes.size()), out.data());
+    std::memcpy(out.data() + 4, a_bytes.data(), a_bytes.size());
+    u32_to_be(static_cast<uint32_t>(b_bytes.size()), out.data() + 4 + a_bytes.size());
+    std::memcpy(out.data() + 8 + a_bytes.size(), b_bytes.data(), b_bytes.size());
+    return out;
+}
+
+static Hash32 sha256_hash(const uint8_t* data, size_t len) {
+    Hash32 out{};
+    SHA256(data, len, out.data());
+    return out;
+}
+
+static Hash32 sha256_concat32(const Hash32& left, const Hash32& right) {
+    Hash32 out{};
+    SHA256_CTX sha;
+    SHA256_Init(&sha);
+    SHA256_Update(&sha, left.data(), left.size());
+    SHA256_Update(&sha, right.data(), right.size());
+    SHA256_Final(out.data(), &sha);
+    return out;
+}
+
+static Hash32 hash_user_leaf(const std::string& user_id, const std::vector<uint8_t>& user_tk_bytes) {
+    uint8_t id_len_be[4];
+    uint8_t tk_len_be[4];
+    u32_to_be(static_cast<uint32_t>(user_id.size()), id_len_be);
+    u32_to_be(static_cast<uint32_t>(user_tk_bytes.size()), tk_len_be);
+    SHA256_CTX sha;
+    SHA256_Init(&sha);
+    const uint8_t domain = 0x01;
+    SHA256_Update(&sha, &domain, 1);
+    SHA256_Update(&sha, id_len_be, sizeof(id_len_be));
+    if (!user_id.empty()) {
+        SHA256_Update(&sha, reinterpret_cast<const uint8_t*>(user_id.data()), user_id.size());
+    }
+    SHA256_Update(&sha, tk_len_be, sizeof(tk_len_be));
+    if (!user_tk_bytes.empty()) {
+        SHA256_Update(&sha, user_tk_bytes.data(), user_tk_bytes.size());
+    }
+    Hash32 out{};
+    SHA256_Final(out.data(), &sha);
+    return out;
+}
+
+static Hash32 hash_owner_leaf(const std::string& owner_id, const std::vector<uint8_t>& owner_enc_sk) {
+    uint8_t len_be[4];
+    u32_to_be(static_cast<uint32_t>(owner_id.size()), len_be);
+    SHA256_CTX sha;
+    SHA256_Init(&sha);
+    const uint8_t domain = 0x02;
+    SHA256_Update(&sha, &domain, 1);
+    SHA256_Update(&sha, len_be, sizeof(len_be));
+    if (!owner_id.empty()) {
+        SHA256_Update(&sha, reinterpret_cast<const uint8_t*>(owner_id.data()), owner_id.size());
+    }
+    if (!owner_enc_sk.empty()) {
+        SHA256_Update(&sha, owner_enc_sk.data(), owner_enc_sk.size());
+    }
+    Hash32 out{};
+    SHA256_Final(out.data(), &sha);
+    return out;
+}
+
+struct MerkleTree {
+    std::vector<std::vector<Hash32>> levels;
+
+    Hash32 root() const {
+        if (levels.empty() || levels.back().empty()) {
+            return Hash32{};
+        }
+        return levels.back().front();
+    }
+
+    std::vector<Hash32> proof(uint32_t index) const {
+        std::vector<Hash32> out;
+        if (levels.empty()) {
+            return out;
+        }
+        for (size_t level = 0; level + 1 < levels.size(); level++) {
+            const auto& cur = levels[level];
+            if (cur.empty()) {
+                break;
+            }
+            uint32_t sibling = index ^ 1U;
+            if (sibling >= cur.size()) {
+                sibling = index;
+            }
+            out.push_back(cur[sibling]);
+            index >>= 1U;
+        }
+        return out;
+    }
+};
+
+static MerkleTree build_merkle_tree(const std::vector<Hash32>& leaves) {
+    MerkleTree tree;
+    if (leaves.empty()) {
+        return tree;
+    }
+    tree.levels.push_back(leaves);
+    while (tree.levels.back().size() > 1) {
+        const auto& cur = tree.levels.back();
+        std::vector<Hash32> next;
+        next.reserve((cur.size() + 1) / 2);
+        for (size_t i = 0; i < cur.size(); i += 2) {
+            const Hash32& left = cur[i];
+            const Hash32& right = (i + 1 < cur.size()) ? cur[i + 1] : cur[i];
+            next.push_back(sha256_concat32(left, right));
+        }
+        tree.levels.push_back(std::move(next));
+    }
+    return tree;
+}
+
+static std::vector<uint8_t> proof_to_bytes(const std::vector<Hash32>& proof) {
+    std::vector<uint8_t> out;
+    out.reserve(proof.size() * 32);
+    for (const auto& h : proof) {
+        out.insert(out.end(), h.begin(), h.end());
+    }
+    return out;
+}
+
+static Hash32 random_hash32() {
+    Hash32 out{};
+    RAND_bytes(out.data(), out.size());
+    return out;
+}
+
+static std::vector<uint8_t> random_bytes_vec(size_t len) {
+    std::vector<uint8_t> out(len);
+    if (len > 0) {
+        RAND_bytes(out.data(), out.size());
+    }
+    return out;
+}
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\"': out += "\\\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+static std::vector<std::string> make_attr_list(int count) {
+    std::vector<std::string> out;
+    out.reserve(count > 0 ? static_cast<size_t>(count) : 0);
+    for (int i = 1; i <= count; i++) {
+        out.push_back("A" + std::to_string(i));
+    }
+    return out;
+}
+
+static std::string make_policy_from_attrs(const std::vector<std::string>& attrs, int policy_attrs, const std::string& mode) {
+    if (policy_attrs <= 0) {
+        return "";
+    }
+    if (static_cast<size_t>(policy_attrs) > attrs.size()) {
+        policy_attrs = static_cast<int>(attrs.size());
+    }
+    std::vector<std::string> parts;
+    parts.reserve(static_cast<size_t>(policy_attrs));
+
+    if (mode == "and") {
+        std::string p;
+        for (int i = 0; i < policy_attrs; i++) {
+            if (i != 0) p += "&";
+            p += attrs[static_cast<size_t>(i)];
+        }
+        return p;
+    }
+    if (mode == "or") {
+        std::string p;
+        for (int i = 0; i < policy_attrs; i++) {
+            if (i != 0) p += "|";
+            p += attrs[static_cast<size_t>(i)];
+        }
+        return p;
+    }
+
+    // mixed: pairwise OR groups joined by AND (similar to TPCH examples)
+    for (int i = 0; i < policy_attrs; i += 2) {
+        if (i + 1 < policy_attrs) {
+            parts.push_back("(" + attrs[static_cast<size_t>(i)] + "|" + attrs[static_cast<size_t>(i + 1)] + ")");
+        } else {
+            parts.push_back("(" + attrs[static_cast<size_t>(i)] + ")");
+        }
+    }
+    std::string p;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i != 0) p += "&";
+        p += parts[i];
+    }
+    return p;
+}
+
+static std::string make_user_id(size_t idx) {
+    return "u" + std::to_string(idx);
+}
+
+// Forward decl (used by BF-IBE wrapper).
+static std::vector<uint8_t> aes256_gcm_encrypt_packed(
+    const uint8_t key[32],
+    const uint8_t* aad,
+    uint32_t aad_len,
+    const uint8_t* plaintext,
+    uint32_t plaintext_len);
+
+// --------------------- IBE (Boneh-Franklin 2001/090 + AES-GCM) ---------------------
+// Hybrid BF-IBE: derive a 256-bit key from a pairing result and wrap arbitrary bytes with AES-256-GCM.
+//
+// Setup: pick P in G2, s in Zr, and publish P_pub = P^s.
+// Extract(ID): Q = H1(ID) in G1, d_ID = Q^s in G1.
+// Encrypt(ID, M): pick r in Zr, U = P^r in G2, W = P_pub^r in G2, K = e(H1(ID), W) in GT, key = H2(bytes(K)),
+//                ct = (|U| || U || AESGCM_key(ID, M)).
+// Decrypt(d_ID, ct): parse U, K = e(d_ID, U), key = H2(bytes(K)), then AES-GCM decrypt.
+//
+// NOTE: This replaces the previous ad-hoc EC-KEM-based "IBE". It aligns the implementation with the cited IBE
+// reference (ePrint 2001/090) and makes IBE costs/encodings depend on the selected pairing curve.
+struct IbeParams {
+    element_t P;      // in G2
+    element_t P_pub;  // in G2
+    element_t s;      // in Zr (msk)
+};
+
+static void ibe_clear(IbeParams& p) {
+    element_clear(p.P);
+    element_clear(p.P_pub);
+    element_clear(p.s);
+}
+
+static IbeParams ibe_setup(pairing_t pairing) {
+    IbeParams p;
+    element_init_G2(p.P, pairing);
+    element_init_G2(p.P_pub, pairing);
+    element_init_Zr(p.s, pairing);
+    element_random(p.P);
+    element_random(p.s);
+    element_pow_zn(p.P_pub, p.P, p.s);
+    return p;
+}
+
+static std::vector<uint8_t> ibe_pub_bytes(IbeParams& p) {
+    std::vector<uint8_t> out;
+    out.reserve(8 + element_length_in_bytes(p.P) + element_length_in_bytes(p.P_pub));
+
+    auto append = [&](element_s* e) {
+        const uint32_t len = static_cast<uint32_t>(element_length_in_bytes(e));
+        uint8_t len_be[4];
+        u32_to_be(len, len_be);
+        out.insert(out.end(), len_be, len_be + 4);
+        const size_t off = out.size();
+        out.resize(off + len);
+        if (len > 0) {
+            element_to_bytes(out.data() + off, e);
+        }
+    };
+
+    append(p.P);
+    append(p.P_pub);
+    return out;
+}
+
+static std::vector<uint8_t> ibe_extract(pairing_t pairing, IbeParams& p, const std::vector<uint8_t>& id) {
+    element_t Q;
+    element_t d_id;
+    element_init_G1(Q, pairing);
+    element_init_G1(d_id, pairing);
+
+    element_from_hash(Q, const_cast<uint8_t*>(id.data()), static_cast<int>(id.size()));
+    element_pow_zn(d_id, Q, p.s);
+
+    const size_t len = static_cast<size_t>(element_length_in_bytes(d_id));
+    std::vector<uint8_t> out(len > 0 ? len : 1, 0);
+    if (len > 0) {
+        element_to_bytes(out.data(), d_id);
+    }
+
+    element_clear(d_id);
+    element_clear(Q);
+    return out;
+}
+
+static std::vector<uint8_t> ibe_encrypt_packed(
+    pairing_t pairing, IbeParams& p, const std::vector<uint8_t>& id, const uint8_t* pt, size_t pt_len) {
+    if (pt == nullptr || pt_len == 0) {
+        return {};
+    }
+
+    element_t r;
+    element_t U;
+    element_t W;
+    element_t Q;
+    element_t K;
+    element_init_Zr(r, pairing);
+    element_init_G2(U, pairing);
+    element_init_G2(W, pairing);
+    element_init_G1(Q, pairing);
+    element_init_GT(K, pairing);
+
+    element_random(r);
+    element_pow_zn(U, p.P, r);
+    element_pow_zn(W, p.P_pub, r);
+    element_from_hash(Q, const_cast<uint8_t*>(id.data()), static_cast<int>(id.size()));
+    pairing_apply(K, Q, W, pairing);
+
+    // key = SHA256(serialize(K))
+    const size_t k_len = static_cast<size_t>(element_length_in_bytes(K));
+    std::vector<uint8_t> k_bytes(k_len > 0 ? k_len : 1, 0);
+    if (k_len > 0) {
+        element_to_bytes(k_bytes.data(), K);
+    }
+    uint8_t key[32];
+    SHA256(k_bytes.data(), k_bytes.size(), key);
+
+    const std::vector<uint8_t> payload = aes256_gcm_encrypt_packed(
+        key,
+        id.empty() ? nullptr : id.data(),
+        static_cast<uint32_t>(id.size()),
+        pt,
+        static_cast<uint32_t>(pt_len));
+
+    const uint32_t u_len = static_cast<uint32_t>(element_length_in_bytes(U));
+    std::vector<uint8_t> out;
+    out.resize(4 + u_len + payload.size());
+    u32_to_be(u_len, out.data());
+    if (u_len > 0) {
+        element_to_bytes(out.data() + 4, U);
+    }
+    if (!payload.empty()) {
+        std::memcpy(out.data() + 4 + u_len, payload.data(), payload.size());
+    }
+
+    element_clear(K);
+    element_clear(Q);
+    element_clear(W);
+    element_clear(U);
+    element_clear(r);
+    return out;
+}
+
+static std::vector<uint8_t> ibe_encrypt_pair(pairing_t pairing, IbeParams& p, const std::vector<uint8_t>& id, const mpz_t b1, const mpz_t b2) {
+    const std::vector<uint8_t> packed = pack_two_mpz(b1, b2);
+    return ibe_encrypt_packed(pairing, p, id, packed.data(), packed.size());
+}
+
+static std::vector<uint8_t> ibe_encrypt_mpz(pairing_t pairing, IbeParams& p, const std::vector<uint8_t>& id, const mpz_t v) {
+    const std::vector<uint8_t> plain = mpz_to_bytes_nonempty(v);
+    return ibe_encrypt_packed(pairing, p, id, plain.data(), plain.size());
+}
+
+static std::vector<uint8_t> aes256_gcm_encrypt_packed(
+    const uint8_t key[32],
+    const uint8_t* aad,
+    uint32_t aad_len,
+    const uint8_t* plaintext,
+    uint32_t plaintext_len) {
+    std::vector<uint8_t> ct;
+    ct.resize(plaintext_len);
+
+    uint8_t iv[12];
+    RAND_bytes(iv, sizeof(iv));
+
+    EVP_CIPHER_CTX* cctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    int ct_len = 0;
+    EVP_EncryptInit_ex(cctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
+    EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_SET_IVLEN, sizeof(iv), nullptr);
+    EVP_EncryptInit_ex(cctx, nullptr, nullptr, key, iv);
+    if (aad != nullptr && aad_len > 0) {
+        EVP_EncryptUpdate(cctx, nullptr, &len, aad, static_cast<int>(aad_len));
+    }
+    if (plaintext_len > 0) {
+        EVP_EncryptUpdate(cctx, ct.data(), &len, plaintext, static_cast<int>(plaintext_len));
+        ct_len += len;
+    }
+    EVP_EncryptFinal_ex(cctx, ct.data() + ct_len, &len);
+    ct_len += len;
+    uint8_t tag[16];
+    EVP_CIPHER_CTX_ctrl(cctx, EVP_CTRL_GCM_GET_TAG, sizeof(tag), tag);
+    EVP_CIPHER_CTX_free(cctx);
+    ct.resize(static_cast<size_t>(ct_len));
+
+    std::vector<uint8_t> out;
+    out.resize(12 + 16 + 4 + ct.size());
+    std::memcpy(out.data(), iv, 12);
+    std::memcpy(out.data() + 12, tag, 16);
+    uint8_t len_be[4];
+    u32_to_be(static_cast<uint32_t>(ct.size()), len_be);
+    std::memcpy(out.data() + 12 + 16, len_be, 4);
+    if (!ct.empty()) {
+        std::memcpy(out.data() + 12 + 16 + 4, ct.data(), ct.size());
+    }
+    return out;
+}
+
+// --------------------- Signature (ECDSA P-256) ---------------------
+struct SigKeyPair {
+    EVP_PKEY* sk = nullptr;
+    EVP_PKEY* vk = nullptr;
+    std::vector<uint8_t> vk_der;
+};
+
+static SigKeyPair sig_keygen() {
+    SigKeyPair kp;
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+    EVP_PKEY_keygen_init(pctx);
+    EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1);
+    EVP_PKEY_keygen(pctx, &kp.sk);
+    EVP_PKEY_CTX_free(pctx);
+
+    // public key der
+    int len = i2d_PUBKEY(kp.sk, nullptr);
+    kp.vk_der.resize(static_cast<size_t>(len));
+    unsigned char* p = kp.vk_der.data();
+    i2d_PUBKEY(kp.sk, &p);
+
+    const unsigned char* p2 = kp.vk_der.data();
+    kp.vk = d2i_PUBKEY(nullptr, &p2, kp.vk_der.size());
+    return kp;
+}
+
+static std::vector<uint8_t> sig_sign(EVP_PKEY* sk, uint64_t t, const Hash32& root_user, const Hash32& root_owner) {
+    uint8_t msg[8 + 32 + 32];
+    u64_to_be(t, msg);
+    std::memcpy(msg + 8, root_user.data(), root_user.size());
+    std::memcpy(msg + 8 + 32, root_owner.data(), root_owner.size());
+    EVP_MD_CTX* m = EVP_MD_CTX_new();
+    EVP_DigestSignInit(m, nullptr, EVP_sha256(), nullptr, sk);
+    EVP_DigestSignUpdate(m, msg, sizeof(msg));
+    size_t sig_len = 0;
+    EVP_DigestSignFinal(m, nullptr, &sig_len);
+    std::vector<uint8_t> sig(sig_len);
+    EVP_DigestSignFinal(m, sig.data(), &sig_len);
+    sig.resize(sig_len);
+    EVP_MD_CTX_free(m);
+    return sig;
+}
+
+// --------------------- KGC (global singleton) ---------------------
+struct KgcContext {
+    IbeParams ibe;
+};
+static KgcContext g_kgc;
+
+// --------------------- OABE size helpers ---------------------
+static size_t element_bytes(const element_s* e) {
+    return static_cast<size_t>(element_length_in_bytes(const_cast<element_s*>(e)));
+}
+
+static size_t fame_sk_bytes(const FAME_OD::sk& sk) {
+    return element_bytes(sk.sk_1) + element_bytes(sk.sk_2) + element_bytes(sk.sk_3);
+}
+
+static size_t fame_sks_bytes(const FAME_OD::sks& s) {
+    size_t total = fame_sk_bytes(s.sk0) + fame_sk_bytes(s.sk_prime);
+    for (const auto* p : s.sk_y) {
+        total += fame_sk_bytes(*p);
+    }
+    return total;
+}
+
+static size_t fame_tk_bytes(const FAME_OD::TK& tk) {
+    return fame_sks_bytes(*tk.TK1);
+}
+
+static size_t fame_dk_bytes(const FAME_OD::DK& dk) {
+    return element_bytes(dk.beta);
+}
+
+static size_t fame_mpk_bytes(const FAME_OD::mpk& mpk) {
+    return element_bytes(mpk.h) + element_bytes(mpk.H1) + element_bytes(mpk.H2) + element_bytes(mpk.T1) + element_bytes(mpk.T2);
+}
+
+static size_t fame_ct_bytes(const FAME_OD::ct& ct) {
+    return element_bytes(ct.ct_1) + element_bytes(ct.ct_2) + element_bytes(ct.ct_3);
+}
+
+static size_t fame_ciphertext_bytes(const FAME_OD::ciphertext& ct) {
+    size_t total = fame_ct_bytes(ct.ct0) + element_bytes(ct.ct_prime) + element_bytes(ct.ct_prime2) + element_bytes(ct.ct_prime3);
+    for (const auto* c : ct.ct_y) {
+        total += fame_ct_bytes(*c);
+    }
+    return total;
+}
+
+static size_t fame_tc_bytes(const FAME_OD::TC& tc) {
+    return element_bytes(tc.ct_prime) + element_bytes(tc.ct_prime2) + element_bytes(tc.ct_prime3) + element_bytes(tc.ct_p);
+}
+
+static void append_element_bytes(std::vector<uint8_t>& out, const element_s* e) {
+    const size_t len = static_cast<size_t>(element_length_in_bytes(const_cast<element_s*>(e)));
+    const size_t off = out.size();
+    out.resize(off + len);
+    if (len > 0) {
+        element_to_bytes(out.data() + off, const_cast<element_s*>(e));
+    }
+}
+
+static std::vector<uint8_t> fame_tk_bytes_vec(const FAME_OD::TK& tk) {
+    std::vector<uint8_t> buf;
+    if (tk.TK1 == nullptr) {
+        return buf;
+    }
+    append_element_bytes(buf, tk.TK1->sk0.sk_1);
+    append_element_bytes(buf, tk.TK1->sk0.sk_2);
+    append_element_bytes(buf, tk.TK1->sk0.sk_3);
+    for (const auto* sk : tk.TK1->sk_y) {
+        append_element_bytes(buf, sk->sk_1);
+        append_element_bytes(buf, sk->sk_2);
+        append_element_bytes(buf, sk->sk_3);
+    }
+    append_element_bytes(buf, tk.TK1->sk_prime.sk_1);
+    append_element_bytes(buf, tk.TK1->sk_prime.sk_2);
+    append_element_bytes(buf, tk.TK1->sk_prime.sk_3);
+    return buf;
+}
+
+static Hash32 fame_tk_hash(const FAME_OD::TK& tk) {
+    const std::vector<uint8_t> buf = fame_tk_bytes_vec(tk);
+    if (buf.empty()) {
+        return Hash32{};
+    }
+    return sha256_hash(buf.data(), buf.size());
+}
+
+static void fame_copy_sk(FAME_OD::sk& dst, FAME_OD::sk& src) {
+    element_set(dst.sk_1, src.sk_1);
+    element_set(dst.sk_2, src.sk_2);
+    element_set(dst.sk_3, src.sk_3);
+}
+
+static void fame_copy_tk(FAME_OD::TK& dst, FAME_OD::TK& src) {
+    if (dst.TK1 == nullptr || src.TK1 == nullptr) {
+        return;
+    }
+    fame_copy_sk(dst.TK1->sk0, src.TK1->sk0);
+    fame_copy_sk(dst.TK1->sk_prime, src.TK1->sk_prime);
+    const size_t y_size = std::min(dst.TK1->sk_y.size(), src.TK1->sk_y.size());
+    for (size_t i = 0; i < y_size; ++i) {
+        fame_copy_sk(*dst.TK1->sk_y[i], *src.TK1->sk_y[i]);
+    }
+}
+
+static void fame_copy_dk(FAME_OD::DK& dst, FAME_OD::DK& src) {
+    element_set(dst.beta, src.beta);
+}
+
+// --------------------- HR-PCH/OD-TPCH simulation ---------------------
+struct State {
+    uint64_t t = 0;
+    Hash32 root_user{};
+    Hash32 root_owner{};
+    std::vector<uint8_t> sig_der;
+};
+
+struct Tx {
+    mpz_t m;
+    mpz_t h1;
+    mpz_t h2;
+    mpz_t n2;
+    mpz_t a1;
+    mpz_t a2;
+    std::string label;           // L (owner_id)
+    std::vector<uint8_t> tx_id;  // 32 bytes
+    std::vector<uint8_t> ibe_ct; // encrypt(b1,b2)
+    element_t K;                 // symmetric key (GT element) for d_dec
+    FAME_OD::ciphertext c_oabe;  // encrypt(K)
+    mpz_t ct_usr;                // AES(K, d_dec)
+    mpz_t r1;
+    mpz_t r2;
+
+    void Init(element_t* Zn, element_t* GT, element_t* G, element_t* H, int rows) {
+        mpz_inits(m, h1, h2, n2, a1, a2, ct_usr, r1, r2, nullptr);
+        element_init_same_as(K, *GT);
+        c_oabe.Init(Zn, G, H, GT, rows);
+    }
+};
+
+static void generate_rsa_with_fixed_e(unsigned long bit_size, mpz_t e, mpz_t n, mpz_t d, mpz_t phi_out) {
+    mpz_t p, q, phi, gcd;
+    mpz_inits(p, q, phi, gcd, nullptr);
+
+    gmp_randstate_t state;
+    gmp_randinit_default(state);
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    const unsigned long long seed = static_cast<unsigned long long>(tv.tv_sec) * 1000000ULL + static_cast<unsigned long long>(tv.tv_usec);
+    gmp_randseed_ui(state, seed);
+
+    while (true) {
+        mpz_urandomb(p, state, bit_size / 2);
+        mpz_nextprime(p, p);
+        mpz_urandomb(q, state, bit_size / 2);
+        mpz_nextprime(q, q);
+
+        mpz_mul(n, p, q);
+        mpz_sub_ui(p, p, 1);
+        mpz_sub_ui(q, q, 1);
+        mpz_mul(phi, p, q);
+
+        mpz_gcd(gcd, e, phi);
+        if (mpz_cmp_ui(gcd, 1) == 0 && mpz_invert(d, e, phi) != 0) {
+            break;
+        }
+    }
+
+    mpz_set(phi_out, phi);
+    gmp_randclear(state);
+    mpz_clears(p, q, phi, gcd, nullptr);
+}
+
+static bool tpch_check(mpz_t& n1, mpz_t& e1, mpz_t& n2, mpz_t& m, mpz_t& h1, mpz_t& h2, mpz_t& r1, mpz_t& r2) {
+    mpz_t x1, x2, tmp, pow;
+    mpz_inits(x1, x2, tmp, pow, nullptr);
+    Hgsm_n_2(m, n1, n2, n1, x1);
+    Hgsm_n_2(m, n1, n2, n2, x2);
+
+    mpz_powm(pow, r1, e1, n1);
+    mpz_mul(tmp, x1, pow);
+    mpz_mod(tmp, tmp, n1);
+    bool ok = (mpz_cmp(tmp, h1) == 0);
+
+    mpz_powm(pow, r2, e1, n2);
+    mpz_mul(tmp, x2, pow);
+    mpz_mod(tmp, tmp, n2);
+    ok = ok && (mpz_cmp(tmp, h2) == 0);
+
+    mpz_clears(x1, x2, tmp, pow, nullptr);
+    return ok;
+}
+
+// very small SVG generator (no external deps)
+static void write_svg_bar(const std::string& path, const std::string& title, const std::vector<std::pair<std::string, double>>& items, const std::string& y_label) {
+    const int width = 900;
+    const int height = 420;
+    const int margin_l = 80;
+    const int margin_r = 20;
+    const int margin_t = 40;
+    const int margin_b = 120;
+    double maxv = 1.0;
+    for (const auto& it : items) maxv = std::max(maxv, it.second);
+
+    std::ostringstream ss;
+    ss << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    ss << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height << "\">\n";
+    ss << "<style>text{font-family:Arial,Helvetica,sans-serif;font-size:12px}</style>\n";
+    ss << "<text x=\"" << width / 2 << "\" y=\"20\" text-anchor=\"middle\" font-size=\"16\" font-weight=\"bold\">" << json_escape(title) << "</text>\n";
+    ss << "<line x1=\"" << margin_l << "\" y1=\"" << (height - margin_b) << "\" x2=\"" << (width - margin_r) << "\" y2=\"" << (height - margin_b) << "\" stroke=\"black\"/>\n";
+    ss << "<line x1=\"" << margin_l << "\" y1=\"" << margin_t << "\" x2=\"" << margin_l << "\" y2=\"" << (height - margin_b) << "\" stroke=\"black\"/>\n";
+    ss << "<text x=\"20\" y=\"" << (height / 2) << "\" transform=\"rotate(-90 20," << (height / 2) << ")\" text-anchor=\"middle\">" << json_escape(y_label) << "</text>\n";
+
+    const int n = static_cast<int>(items.size());
+    const double plot_w = (width - margin_l - margin_r);
+    const double bar_w = plot_w / std::max(1, n) * 0.7;
+    const double gap = plot_w / std::max(1, n) * 0.3;
+    for (int i = 0; i < n; i++) {
+        const double v = items[i].second;
+        const double x = margin_l + i * (bar_w + gap) + gap / 2.0;
+        const double h = (height - margin_t - margin_b) * (v / maxv);
+        const double y = (height - margin_b) - h;
+        ss << "<rect x=\"" << x << "\" y=\"" << y << "\" width=\"" << bar_w << "\" height=\"" << h << "\" fill=\"#4e79a7\"/>\n";
+        ss << "<text x=\"" << (x + bar_w / 2) << "\" y=\"" << (height - margin_b + 16) << "\" text-anchor=\"middle\" transform=\"rotate(30 " << (x + bar_w / 2) << "," << (height - margin_b + 16) << ")\">" << json_escape(items[i].first) << "</text>\n";
+        ss << "<text x=\"" << (x + bar_w / 2) << "\" y=\"" << (y - 6) << "\" text-anchor=\"middle\">" << v << "</text>\n";
+    }
+    ss << "</svg>\n";
+
+    std::ofstream f(path, std::ios::binary);
+    f << ss.str();
+}
+
+int main(int argc, char** argv) {
+    std::string curve = "a";
+    std::string out_path = "artifacts/results.json";
+    int attr_count = 60;
+    int policy_attrs = 20;
+    std::string policy_mode = "mixed";
+    std::string do_id = "do1";
+    std::string bench;
+    size_t user_count = 1024;
+    int rsa_bits = 3072;
+    size_t bench_threads = 1;
+    size_t bench_iters = 20;
+    size_t bench_tasks = 200;
+    std::string bench_mode = "hrpch";
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--curve") == 0 && i + 1 < argc) {
+            curve = argv[++i];
+        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            out_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--attrs") == 0 && i + 1 < argc) {
+            attr_count = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--policy-attrs") == 0 && i + 1 < argc) {
+            policy_attrs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--policy-mode") == 0 && i + 1 < argc) {
+            policy_mode = argv[++i];
+        } else if (std::strcmp(argv[i], "--do-id") == 0 && i + 1 < argc) {
+            do_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            bench = argv[++i];
+        } else if (std::strcmp(argv[i], "--user-count") == 0 && i + 1 < argc) {
+            user_count = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--rsa-bits") == 0 && i + 1 < argc) {
+            rsa_bits = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            bench_threads = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+            bench_iters = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argv[i], "--tasks") == 0 && i + 1 < argc) {
+            bench_tasks = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
+        } else if ((std::strcmp(argv[i], "--mode") == 0 || std::strcmp(argv[i], "--throughput-mode") == 0) && i + 1 < argc) {
+            bench_mode = argv[++i];
+        }
+    }
+
+    std::system("mkdir -p artifacts");
+
+    // ---------- resolve pairing parameter string ----------
+    // We pass the exact PBC parameter string to the enclave so that BF-IBE decryption can run inside SGX.
+    static const char kTypeA_MatchMNT224[] =
+        "type a\n"
+        "q 17766997032643197491046606944190905774051190620006706915460055046138442399897523902114896912007863886941424946913235397726710002627363672764129867099692660030872615227193606101386160344094161837653380711\n"
+        "h 659014546727253126099258596647467033612527390198793135375504282663445307024319858867227512246280204015635703803863849910726199405209704\n"
+        "r 26959946667150639794667015087019630673637144422540572481103610249153\n"
+        "exp2 224\n"
+        "exp1 6\n"
+        "sign1 -1\n"
+        "sign0 1\n";
+
+    CurveParams curves;
+    std::string param;
+    if (curve == "a") param = curves.a_param;
+    else if (curve == "a672" || curve == "typea-mnt224") param = kTypeA_MatchMNT224;
+    else if (curve == "a1") param = curves.a1_param;
+    else if (curve == "e") param = curves.e_param;
+    else if (curve == "i") param = curves.i_param;
+    else if (curve == "f") param = curves.f_param;
+    else if (curve == "d224" || curve == "mnt224") param = curves.d224_param;
+    else {
+        std::fprintf(stderr, "unknown curve\n");
+        return 1;
+    }
+
+    if (bench == "state") {
+        if (user_count < 1) {
+            std::fprintf(stderr, "missing --user-count\n");
+            return 1;
+        }
+
+        std::map<std::string, double> t_ms;
+        std::map<std::string, size_t> s_bytes;
+
+        const uint64_t ts_keygen = now_us();
+        SigKeyPair sig_kp = sig_keygen();
+        const uint64_t te_keygen = now_us();
+        t_ms["SIG.KeyGen(KGC)"] = (te_keygen - ts_keygen) / 1000.0;
+        s_bytes["vk_sig"] = sig_kp.vk_der.size();
+
+        // SGX enclave create + provision (dummy d1)
+        sgx_enclave_id_t eid = 0;
+        sgx_launch_token_t token = {0};
+        int updated = 0;
+        const char* enclave_path = "enclave.signed.so";
+        sgx_status_t st = sgx_create_enclave(enclave_path, SGX_DEBUG_FLAG, &token, &updated, &eid, nullptr);
+        if (st != SGX_SUCCESS) {
+            std::printf("sgx_create_enclave failed: 0x%x\n", st);
+            return 2;
+        }
+
+        const std::vector<uint8_t> dummy_d1 = {1};
+        Hash32 ktee_key{};
+        RAND_bytes(ktee_key.data(), ktee_key.size());
+        int ecall_ret = -1;
+        st = ecall_provision(eid, &ecall_ret, const_cast<uint8_t*>(dummy_d1.data()), dummy_d1.size(),
+                             ktee_key.data(), ktee_key.size(),
+                             const_cast<uint8_t*>(sig_kp.vk_der.data()), sig_kp.vk_der.size(),
+                             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(param.c_str())),
+                             static_cast<uint32_t>(param.size() + 1));
+        if (st != SGX_SUCCESS || ecall_ret != 0) {
+            std::printf("ecall_provision failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            sgx_destroy_enclave(eid);
+            return 3;
+        }
+
+        const size_t target_idx = user_count / 2;
+        const std::string target_user = make_user_id(target_idx);
+
+        // Build owner list (single owner for state bench)
+        const std::string owner_id = "owner0";
+        std::vector<uint8_t> owner_plain_sk(32);
+        RAND_bytes(owner_plain_sk.data(), owner_plain_sk.size());
+        const std::vector<uint8_t> owner_enc_sk =
+            aes256_gcm_encrypt_packed(ktee_key.data(),
+                                      reinterpret_cast<const uint8_t*>(owner_id.data()),
+                                      static_cast<uint32_t>(owner_id.size()),
+                                      owner_plain_sk.data(),
+                                      static_cast<uint32_t>(owner_plain_sk.size()));
+        std::vector<Hash32> owner_leaves;
+        owner_leaves.push_back(hash_owner_leaf(owner_id, owner_enc_sk));
+        const MerkleTree owner_tree = build_merkle_tree(owner_leaves);
+        const Hash32 root_owner = owner_tree.root();
+
+        // Build user list (Merkle tree of TK entries)
+        std::vector<Hash32> user_leaves;
+        user_leaves.reserve(user_count);
+        const std::vector<uint8_t> target_tk_bytes = random_bytes_vec(32);
+        for (size_t i = 0; i < user_count; i++) {
+            const std::string uid = make_user_id(i);
+            const std::vector<uint8_t> tk_bytes =
+                (i == target_idx) ? target_tk_bytes : random_bytes_vec(target_tk_bytes.size());
+            user_leaves.push_back(hash_user_leaf(uid, tk_bytes));
+        }
+        const MerkleTree user_tree = build_merkle_tree(user_leaves);
+        const Hash32 root_user = user_tree.root();
+        const std::vector<Hash32> user_proof = user_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> user_proof_bytes = proof_to_bytes(user_proof);
+
+        s_bytes["state.root_user_bytes"] = root_user.size();
+        s_bytes["state.root_owner_bytes"] = root_owner.size();
+        s_bytes["state.user_proof_bytes"] = user_proof_bytes.size();
+        s_bytes["state.owner_proof_bytes"] = 0;
+        s_bytes["state.user_leaf_bytes"] = 1 + 4 + target_user.size() + 4 + target_tk_bytes.size();
+        s_bytes["state.owner_leaf_bytes"] = 1 + 4 + owner_id.size() + owner_enc_sk.size();
+        s_bytes["state.owner_enc_sk_bytes"] = owner_enc_sk.size();
+
+        // allowed state
+        const uint64_t t0 = 0;
+        const uint64_t ts_sign0 = now_us();
+        const std::vector<uint8_t> sig0 = sig_sign(sig_kp.sk, t0, root_user, root_owner);
+        const uint64_t te_sign0 = now_us();
+        t_ms["State.Sign(KGC,allowed)"] = (te_sign0 - ts_sign0) / 1000.0;
+        s_bytes["state.sig_bytes"] = sig0.size();
+
+        const uint64_t ts_chk0 = now_us();
+        ecall_ret = -1;
+        st = ecall_state_check(
+            eid,
+            &ecall_ret,
+            t0,
+            const_cast<uint8_t*>(root_user.data()),
+            const_cast<uint8_t*>(root_owner.data()),
+            const_cast<uint8_t*>(sig0.data()),
+            sig0.size(),
+            target_user.c_str(),
+            static_cast<uint32_t>(target_idx),
+            const_cast<uint8_t*>(target_tk_bytes.data()),
+            static_cast<uint32_t>(target_tk_bytes.size()),
+            const_cast<uint8_t*>(user_proof_bytes.data()),
+            static_cast<uint32_t>(user_proof_bytes.size()));
+        const uint64_t te_chk0 = now_us();
+        t_ms["State.Check(TEE,allowed)"] = (te_chk0 - ts_chk0) / 1000.0;
+
+        // revoked state: replace target leaf so proof fails
+        std::vector<Hash32> revoked_leaves = user_leaves;
+        revoked_leaves[target_idx] = hash_user_leaf(target_user, random_bytes_vec(target_tk_bytes.size()));
+        const MerkleTree revoked_tree = build_merkle_tree(revoked_leaves);
+        const Hash32 root_user_revoked = revoked_tree.root();
+        const std::vector<Hash32> revoked_proof = revoked_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> revoked_proof_bytes = proof_to_bytes(revoked_proof);
+
+        const uint64_t t1 = 1;
+        const uint64_t ts_sign1 = now_us();
+        const std::vector<uint8_t> sig1 = sig_sign(sig_kp.sk, t1, root_user_revoked, root_owner);
+        const uint64_t te_sign1 = now_us();
+        t_ms["State.Sign(KGC,revoked)"] = (te_sign1 - ts_sign1) / 1000.0;
+
+        const uint64_t ts_chk1 = now_us();
+        ecall_ret = -1;
+        st = ecall_state_check(
+            eid,
+            &ecall_ret,
+            t1,
+            const_cast<uint8_t*>(root_user_revoked.data()),
+            const_cast<uint8_t*>(root_owner.data()),
+            const_cast<uint8_t*>(sig1.data()),
+            sig1.size(),
+            target_user.c_str(),
+            static_cast<uint32_t>(target_idx),
+            const_cast<uint8_t*>(target_tk_bytes.data()),
+            static_cast<uint32_t>(target_tk_bytes.size()),
+            const_cast<uint8_t*>(revoked_proof_bytes.data()),
+            static_cast<uint32_t>(revoked_proof_bytes.size()));
+        const uint64_t te_chk1 = now_us();
+        t_ms["State.Check(TEE,revoked)"] = (te_chk1 - ts_chk1) / 1000.0;
+        if (st == SGX_SUCCESS && ecall_ret == 0) {
+            std::fprintf(stderr, "unexpected: revoked user accepted\n");
+        }
+
+        // output json
+        std::ostringstream js;
+        js << "{\n";
+        js << "  \"params\": {\n";
+        js << "    \"bench\": \"state\",\n";
+        js << "    \"dlo_version\": \"" << kDloVersion << "\",\n";
+        js << "    \"curve\": \"" << json_escape(curve) << "\",\n";
+        js << "    \"user_count\": " << user_count << "\n";
+        js << "  },\n";
+        js << "  \"times_ms\": {\n";
+        {
+            bool first = true;
+            for (const auto& kv : t_ms) {
+                if (!first) js << ",\n";
+                first = false;
+                js << "    \"" << json_escape(kv.first) << "\": " << kv.second;
+            }
+            js << "\n";
+        }
+        js << "  },\n";
+        js << "  \"sizes_bytes\": {\n";
+        {
+            bool first = true;
+            for (const auto& kv : s_bytes) {
+                if (!first) js << ",\n";
+                first = false;
+                js << "    \"" << json_escape(kv.first) << "\": " << kv.second;
+            }
+            js << "\n";
+        }
+        js << "  }\n";
+        js << "}\n";
+
+        {
+            std::ofstream out(out_path, std::ios::binary);
+            out << js.str();
+        }
+
+        sgx_destroy_enclave(eid);
+        EVP_PKEY_free(sig_kp.sk);
+        EVP_PKEY_free(sig_kp.vk);
+        return 0;
+    }
+
+    // ---------- pairing init ----------
+    pbc_param_t par;
+    pairing_t pairing;
+    pbc_param_init_set_str(par, param.c_str());
+    pairing_init_pbc_param(pairing, par);
+
+    element_t G1, G2, GT, Zp;
+    element_init_G1(G1, pairing);
+    element_init_G2(G2, pairing);
+    element_init_GT(GT, pairing);
+    element_init_Zr(Zp, pairing);
+
+    if (bench == "throughput") {
+        if (bench_threads < 1) bench_threads = 1;
+        if (bench_iters < 1) bench_iters = 10;
+        if (user_count < 1) user_count = 1024;
+
+        mpz_t n1, e1, d1, phi1;
+        mpz_inits(n1, e1, d1, phi1, nullptr);
+
+        FAME_OD fame(&G1, &G2, &GT, &Zp);
+        FAME_OD::msk msk_abe;
+        FAME_OD::mpk mpk_abe;
+        msk_abe.Init(&G1, &G2, &Zp);
+        mpk_abe.Init(&G2, &GT);
+
+        {
+            MyRSA rsa(&n1, &e1, &d1);
+            rsa.rsa_generate_keys_2(rsa_bits, 1, &phi1);
+            fame.Setup(&msk_abe, &mpk_abe);
+            g_kgc.ibe = ibe_setup(pairing);
+        }
+
+        SigKeyPair sig_kp = sig_keygen();
+
+        sgx_enclave_id_t eid = 0;
+        sgx_launch_token_t token = {0};
+        int updated = 0;
+        const char* enclave_path = "enclave.signed.so";
+        sgx_status_t st = sgx_create_enclave(enclave_path, SGX_DEBUG_FLAG, &token, &updated, &eid, nullptr);
+        if (st != SGX_SUCCESS) {
+            std::printf("sgx_create_enclave failed: 0x%x\n", st);
+            return 2;
+        }
+
+        const std::vector<uint8_t> d1_bytes = mpz_to_bytes(d1);
+        Hash32 ktee_key{};
+        RAND_bytes(ktee_key.data(), ktee_key.size());
+        int ecall_ret = -1;
+        st = ecall_provision(eid, &ecall_ret, const_cast<uint8_t*>(d1_bytes.data()), d1_bytes.size(),
+                             ktee_key.data(), ktee_key.size(),
+                             const_cast<uint8_t*>(sig_kp.vk_der.data()), sig_kp.vk_der.size(),
+                             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(param.c_str())),
+                             static_cast<uint32_t>(param.size() + 1));
+        if (st != SGX_SUCCESS || ecall_ret != 0) {
+            std::printf("ecall_provision failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            sgx_destroy_enclave(eid);
+            return 3;
+        }
+
+        if (attr_count < 1) attr_count = 1;
+        if (policy_attrs < 1) policy_attrs = 1;
+        if (policy_attrs > attr_count) policy_attrs = attr_count;
+        const std::vector<std::string> attrs = make_attr_list(attr_count);
+        const std::string policy = make_policy_from_attrs(attrs, policy_attrs, policy_mode);
+
+        FAME_OD::TK tk;
+        FAME_OD::DK dk;
+        tk.Init(&G1, &G2, static_cast<int>(attrs.size()));
+        dk.Init(&Zp);
+        fame.KeyGen(&msk_abe, &mpk_abe, const_cast<std::vector<std::string>*>(&attrs), &tk, &dk);
+
+        const size_t target_idx = user_count / 2;
+        const std::string user_id = make_user_id(target_idx);
+        const std::vector<uint8_t> do_id_bytes(do_id.begin(), do_id.end());
+        const std::string owner_id = do_id;
+
+        const std::vector<uint8_t> user_tk_bytes = fame_tk_bytes_vec(tk);
+        std::vector<Hash32> user_leaves;
+        user_leaves.reserve(user_count);
+        for (size_t i = 0; i < user_count; i++) {
+            const std::string uid = make_user_id(i);
+            const std::vector<uint8_t> tk_bytes =
+                (i == target_idx) ? user_tk_bytes : random_bytes_vec(user_tk_bytes.size());
+            user_leaves.push_back(hash_user_leaf(uid, tk_bytes));
+        }
+        const MerkleTree user_tree = build_merkle_tree(user_leaves);
+        const Hash32 root_user = user_tree.root();
+        const std::vector<Hash32> user_proof = user_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> user_proof_bytes = proof_to_bytes(user_proof);
+        const uint8_t* user_proof_ptr = user_proof_bytes.empty() ? nullptr : user_proof_bytes.data();
+
+        const std::vector<uint8_t> owner_sk = ibe_extract(pairing, g_kgc.ibe, do_id_bytes);
+        const std::vector<uint8_t> owner_enc_sk = aes256_gcm_encrypt_packed(
+            ktee_key.data(),
+            do_id_bytes.data(),
+            static_cast<uint32_t>(do_id_bytes.size()),
+            owner_sk.data(),
+            static_cast<uint32_t>(owner_sk.size()));
+        std::vector<Hash32> owner_leaves;
+        owner_leaves.push_back(hash_owner_leaf(owner_id, owner_enc_sk));
+        const MerkleTree owner_tree = build_merkle_tree(owner_leaves);
+        const Hash32 root_owner = owner_tree.root();
+        const std::vector<Hash32> owner_proof = owner_tree.proof(0);
+        const std::vector<uint8_t> owner_proof_bytes = proof_to_bytes(owner_proof);
+        const uint8_t* owner_proof_ptr = owner_proof_bytes.empty() ? nullptr : owner_proof_bytes.data();
+
+        State st0;
+        st0.t = 0;
+        st0.root_user = root_user;
+        st0.root_owner = root_owner;
+        st0.sig_der = sig_sign(sig_kp.sk, st0.t, st0.root_user, st0.root_owner);
+
+        mpz_t m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_a1, inv_a2;
+        mpz_inits(m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_a1, inv_a2, nullptr);
+        GenerateRandomWithLength(m, 128);
+        GenerateRandomWithLength(m_p, 128);
+        generate_rsa_with_fixed_e(static_cast<unsigned long>(rsa_bits), e1, n2, d2, phi2);
+        GenerateRandomInZnStar(r1, n1);
+        GenerateRandomInZnStar(r2, n2);
+        GenerateRandomInZnStar(k, phi2);
+        GenerateRandomInZnStar(a1, phi2);
+        GenerateRandomInZnStar(a2, phi2);
+        mpz_invert(inv_a1, a1, phi2);
+        mpz_mul(b1, k, inv_a1);
+        mpz_mod(b1, b1, phi2);
+        mpz_invert(inv_a2, a2, phi2);
+        mpz_mul(b2, k, inv_a2);
+        mpz_mod(b2, b2, phi2);
+
+        // server-side compute mu1 and mu2_i
+        mpz_t h1, h1_m, h1_mp, r1_pow, inv_h1_mp, mu1;
+        mpz_inits(h1, h1_m, h1_mp, r1_pow, inv_h1_mp, mu1, nullptr);
+        Hgsm_n_2(m, n1, n2, n1, h1_m);
+        mpz_powm(r1_pow, r1, e1, n1);
+        mpz_mul(h1, h1_m, r1_pow);
+        mpz_mod(h1, h1, n1);
+        Hgsm_n_2(m_p, n1, n2, n1, h1_mp);
+        mpz_invert(inv_h1_mp, h1_mp, n1);
+        mpz_mul(mu1, h1, inv_h1_mp);
+        mpz_mod(mu1, mu1, n1);
+
+        mpz_t x2_m, x2_mp, y2, inv_x2_mp, X, mu2_1, mu2_2;
+        mpz_inits(x2_m, x2_mp, y2, inv_x2_mp, X, mu2_1, mu2_2, nullptr);
+        Hgsm_n_2(m, n1, n2, n2, x2_m);
+        Hgsm_n_2(m_p, n1, n2, n2, x2_mp);
+        mpz_powm(y2, r2, e1, n2);
+        mpz_mul(y2, x2_m, y2);
+        mpz_mod(y2, y2, n2);
+        mpz_invert(inv_x2_mp, x2_mp, n2);
+        mpz_mul(X, y2, inv_x2_mp);
+        mpz_mod(X, X, n2);
+        mpz_powm(mu2_1, X, a1, n2);
+        mpz_powm(mu2_2, X, a2, n2);
+
+        const std::vector<uint8_t> ibe_ct = ibe_encrypt_pair(pairing, g_kgc.ibe, do_id_bytes, b1, b2);
+
+        const std::vector<uint8_t> n1_bytes = mpz_to_bytes(n1);
+        const std::vector<uint8_t> e1_bytes = mpz_to_bytes(e1);
+        const std::vector<uint8_t> n2_bytes = mpz_to_bytes(n2);
+        const std::vector<uint8_t> m_bytes = mpz_to_bytes(m);
+        const std::vector<uint8_t> mp_bytes = mpz_to_bytes(m_p);
+        const std::vector<uint8_t> h1_bytes = mpz_to_bytes(h1);
+        const std::vector<uint8_t> r1_bytes = mpz_to_bytes(r1);
+        const std::vector<uint8_t> r2_bytes = mpz_to_bytes(r2);
+        const std::vector<uint8_t> mu1_bytes = mpz_to_bytes(mu1);
+        const std::vector<uint8_t> mu21_bytes = mpz_to_bytes(mu2_1);
+        const std::vector<uint8_t> mu22_bytes = mpz_to_bytes(mu2_2);
+        const std::vector<uint8_t> a1_bytes = mpz_to_bytes(a1);
+        const std::vector<uint8_t> a2_bytes = mpz_to_bytes(a2);
+
+        const uint32_t user_idx_u = static_cast<uint32_t>(target_idx);
+        const uint32_t owner_idx_u = 0;
+        const bool use_all_tee = (bench_mode == "all_tee");
+        std::atomic<size_t> failures{0};
+
+        const uint64_t ts = now_us();
+        std::vector<std::thread> threads;
+        threads.reserve(bench_threads);
+        for (size_t t = 0; t < bench_threads; t++) {
+            threads.emplace_back([&]() {
+                for (size_t i = 0; i < bench_iters; i++) {
+                    std::vector<uint8_t> r1p_buf(512);
+                    std::vector<uint8_t> pi_buf(512);
+                    uint32_t r1p_len = 0;
+                    uint32_t pi_len = 0;
+                    int local_ret = -1;
+                    sgx_status_t rc = SGX_ERROR_UNEXPECTED;
+                    if (use_all_tee) {
+                        rc = ecall_hrpch_insider_adapt_all_tee(
+                            eid,
+                            &local_ret,
+                            st0.t,
+                            const_cast<uint8_t*>(st0.root_user.data()),
+                            const_cast<uint8_t*>(st0.root_owner.data()),
+                            const_cast<uint8_t*>(st0.sig_der.data()),
+                            st0.sig_der.size(),
+                            user_id.c_str(),
+                            user_idx_u,
+                            const_cast<uint8_t*>(user_tk_bytes.data()),
+                            static_cast<uint32_t>(user_tk_bytes.size()),
+                            const_cast<uint8_t*>(user_proof_ptr),
+                            static_cast<uint32_t>(user_proof_bytes.size()),
+                            owner_id.c_str(),
+                            owner_idx_u,
+                            const_cast<uint8_t*>(owner_enc_sk.data()),
+                            static_cast<uint32_t>(owner_enc_sk.size()),
+                            const_cast<uint8_t*>(owner_proof_ptr),
+                            static_cast<uint32_t>(owner_proof_bytes.size()),
+                            const_cast<uint8_t*>(n1_bytes.data()),
+                            n1_bytes.size(),
+                            const_cast<uint8_t*>(e1_bytes.data()),
+                            e1_bytes.size(),
+                            const_cast<uint8_t*>(n2_bytes.data()),
+                            n2_bytes.size(),
+                            const_cast<uint8_t*>(m_bytes.data()),
+                            m_bytes.size(),
+                            const_cast<uint8_t*>(mp_bytes.data()),
+                            mp_bytes.size(),
+                            const_cast<uint8_t*>(h1_bytes.data()),
+                            h1_bytes.size(),
+                            const_cast<uint8_t*>(r1_bytes.data()),
+                            r1_bytes.size(),
+                            const_cast<uint8_t*>(r2_bytes.data()),
+                            r2_bytes.size(),
+                            const_cast<uint8_t*>(a1_bytes.data()),
+                            a1_bytes.size(),
+                            const_cast<uint8_t*>(a2_bytes.data()),
+                            a2_bytes.size(),
+                            const_cast<uint8_t*>(ibe_ct.data()),
+                            ibe_ct.size(),
+                            r1p_buf.data(),
+                            r1p_buf.size(),
+                            &r1p_len,
+                            pi_buf.data(),
+                            pi_buf.size(),
+                            &pi_len);
+                    } else {
+                        rc = ecall_hrpch_insider_adapt(
+                            eid,
+                            &local_ret,
+                            st0.t,
+                            const_cast<uint8_t*>(st0.root_user.data()),
+                            const_cast<uint8_t*>(st0.root_owner.data()),
+                            const_cast<uint8_t*>(st0.sig_der.data()),
+                            st0.sig_der.size(),
+                            user_id.c_str(),
+                            user_idx_u,
+                            const_cast<uint8_t*>(user_tk_bytes.data()),
+                            static_cast<uint32_t>(user_tk_bytes.size()),
+                            const_cast<uint8_t*>(user_proof_ptr),
+                            static_cast<uint32_t>(user_proof_bytes.size()),
+                            owner_id.c_str(),
+                            owner_idx_u,
+                            const_cast<uint8_t*>(owner_enc_sk.data()),
+                            static_cast<uint32_t>(owner_enc_sk.size()),
+                            const_cast<uint8_t*>(owner_proof_ptr),
+                            static_cast<uint32_t>(owner_proof_bytes.size()),
+                            const_cast<uint8_t*>(n1_bytes.data()),
+                            n1_bytes.size(),
+                            const_cast<uint8_t*>(e1_bytes.data()),
+                            e1_bytes.size(),
+                            const_cast<uint8_t*>(n2_bytes.data()),
+                            n2_bytes.size(),
+                            const_cast<uint8_t*>(m_bytes.data()),
+                            m_bytes.size(),
+                            const_cast<uint8_t*>(mp_bytes.data()),
+                            mp_bytes.size(),
+                            const_cast<uint8_t*>(h1_bytes.data()),
+                            h1_bytes.size(),
+                            const_cast<uint8_t*>(mu1_bytes.data()),
+                            mu1_bytes.size(),
+                            const_cast<uint8_t*>(mu21_bytes.data()),
+                            mu21_bytes.size(),
+                            const_cast<uint8_t*>(mu22_bytes.data()),
+                            mu22_bytes.size(),
+                            const_cast<uint8_t*>(ibe_ct.data()),
+                            ibe_ct.size(),
+                            r1p_buf.data(),
+                            r1p_buf.size(),
+                            &r1p_len,
+                            pi_buf.data(),
+                            pi_buf.size(),
+                            &pi_len);
+                    }
+                    if (rc != SGX_SUCCESS || local_ret != 0) {
+                        failures.fetch_add(1);
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        const uint64_t te = now_us();
+
+        const double elapsed_ms = static_cast<double>(te - ts) / 1000.0;
+        const double elapsed_s = elapsed_ms / 1000.0;
+        const size_t total_ops = bench_threads * bench_iters;
+        const double tps = (elapsed_s > 0.0) ? (static_cast<double>(total_ops) / elapsed_s) : 0.0;
+        const double avg_ms = (total_ops > 0) ? (elapsed_ms / static_cast<double>(total_ops)) : 0.0;
+
+        std::ostringstream js;
+        js << "{\n";
+        js << "  \"params\": {\n";
+        js << "    \"bench\": \"throughput\",\n";
+        js << "    \"mode\": \"" << json_escape(bench_mode) << "\",\n";
+        js << "    \"dlo_version\": \"" << kDloVersion << "\",\n";
+        js << "    \"curve\": \"" << json_escape(curve) << "\",\n";
+        js << "    \"rsa_bits\": " << rsa_bits << ",\n";
+        js << "    \"attrs\": " << attrs.size() << ",\n";
+        js << "    \"policy\": \"" << json_escape(policy) << "\",\n";
+        js << "    \"user_count\": " << user_count << ",\n";
+        js << "    \"threads\": " << bench_threads << ",\n";
+        js << "    \"iters\": " << bench_iters << "\n";
+        js << "  },\n";
+        js << "  \"results\": {\n";
+        js << "    \"total_ops\": " << total_ops << ",\n";
+        js << "    \"elapsed_ms\": " << elapsed_ms << ",\n";
+        js << "    \"avg_ms\": " << avg_ms << ",\n";
+        js << "    \"tps\": " << tps << ",\n";
+        js << "    \"failures\": " << failures.load() << "\n";
+        js << "  }\n";
+        js << "}\n";
+
+        {
+            std::ofstream out(out_path, std::ios::binary);
+            out << js.str();
+        }
+
+        sgx_destroy_enclave(eid);
+        EVP_PKEY_free(sig_kp.sk);
+        EVP_PKEY_free(sig_kp.vk);
+        ibe_clear(g_kgc.ibe);
+
+        mpz_clears(n1, e1, d1, phi1, nullptr);
+        mpz_clears(m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_a1, inv_a2, nullptr);
+        mpz_clears(h1, h1_m, h1_mp, r1_pow, inv_h1_mp, mu1, nullptr);
+        mpz_clears(x2_m, x2_mp, y2, inv_x2_mp, X, mu2_1, mu2_2, nullptr);
+
+        return 0;
+    }
+
+    if (bench == "cost") {
+        if (bench_threads < 1) bench_threads = 1;
+        if (bench_tasks < 1) bench_tasks = 1;
+        if (user_count < 1) user_count = 1024;
+
+        mpz_t n1, e1, d1, phi1;
+        mpz_inits(n1, e1, d1, phi1, nullptr);
+
+        FAME_OD fame(&G1, &G2, &GT, &Zp);
+        FAME_OD::msk msk_abe;
+        FAME_OD::mpk mpk_abe;
+        msk_abe.Init(&G1, &G2, &Zp);
+        mpk_abe.Init(&G2, &GT);
+
+        {
+            MyRSA rsa(&n1, &e1, &d1);
+            rsa.rsa_generate_keys_2(rsa_bits, 1, &phi1);
+            fame.Setup(&msk_abe, &mpk_abe);
+            g_kgc.ibe = ibe_setup(pairing);
+        }
+
+        SigKeyPair sig_kp = sig_keygen();
+
+        sgx_enclave_id_t eid = 0;
+        sgx_launch_token_t token = {0};
+        int updated = 0;
+        const char* enclave_path = "enclave.signed.so";
+        sgx_status_t st = sgx_create_enclave(enclave_path, SGX_DEBUG_FLAG, &token, &updated, &eid, nullptr);
+        if (st != SGX_SUCCESS) {
+            std::printf("sgx_create_enclave failed: 0x%x\n", st);
+            return 2;
+        }
+
+        const std::vector<uint8_t> d1_bytes = mpz_to_bytes(d1);
+        Hash32 ktee_key{};
+        RAND_bytes(ktee_key.data(), ktee_key.size());
+        int ecall_ret = -1;
+        st = ecall_provision(eid, &ecall_ret, const_cast<uint8_t*>(d1_bytes.data()), d1_bytes.size(),
+                             ktee_key.data(), ktee_key.size(),
+                             const_cast<uint8_t*>(sig_kp.vk_der.data()), sig_kp.vk_der.size(),
+                             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(param.c_str())),
+                             static_cast<uint32_t>(param.size() + 1));
+        if (st != SGX_SUCCESS || ecall_ret != 0) {
+            std::printf("ecall_provision failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            sgx_destroy_enclave(eid);
+            return 3;
+        }
+
+        if (attr_count < 1) attr_count = 1;
+        if (policy_attrs < 1) policy_attrs = 1;
+        if (policy_attrs > attr_count) policy_attrs = attr_count;
+        const std::vector<std::string> attrs = make_attr_list(attr_count);
+        const std::string policy = make_policy_from_attrs(attrs, policy_attrs, policy_mode);
+
+        FAME_OD::TK tk_shared;
+        FAME_OD::DK dk_shared;
+        tk_shared.Init(&G1, &G2, static_cast<int>(attrs.size()));
+        dk_shared.Init(&Zp);
+        fame.KeyGen(&msk_abe, &mpk_abe, const_cast<std::vector<std::string>*>(&attrs), &tk_shared, &dk_shared);
+
+        const size_t target_idx = user_count / 2;
+        const std::string user_id = make_user_id(target_idx);
+        const std::string owner_id = do_id;
+        const std::vector<uint8_t> owner_id_bytes(owner_id.begin(), owner_id.end());
+
+        const std::vector<uint8_t> user_tk_bytes = fame_tk_bytes_vec(tk_shared);
+        std::vector<Hash32> user_leaves;
+        user_leaves.reserve(user_count);
+        for (size_t i = 0; i < user_count; i++) {
+            const std::string uid = make_user_id(i);
+            const std::vector<uint8_t> tk_bytes =
+                (i == target_idx) ? user_tk_bytes : random_bytes_vec(user_tk_bytes.size());
+            user_leaves.push_back(hash_user_leaf(uid, tk_bytes));
+        }
+        const MerkleTree user_tree = build_merkle_tree(user_leaves);
+        const Hash32 root_user = user_tree.root();
+        const std::vector<Hash32> user_proof = user_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> user_proof_bytes = proof_to_bytes(user_proof);
+        const uint8_t* user_proof_ptr = user_proof_bytes.empty() ? nullptr : user_proof_bytes.data();
+
+        const std::vector<uint8_t> owner_sk = ibe_extract(pairing, g_kgc.ibe, owner_id_bytes);
+        const std::vector<uint8_t> owner_enc_sk = aes256_gcm_encrypt_packed(
+            ktee_key.data(),
+            owner_id_bytes.data(),
+            static_cast<uint32_t>(owner_id_bytes.size()),
+            owner_sk.data(),
+            static_cast<uint32_t>(owner_sk.size()));
+        std::vector<Hash32> owner_leaves;
+        owner_leaves.push_back(hash_owner_leaf(owner_id, owner_enc_sk));
+        const MerkleTree owner_tree = build_merkle_tree(owner_leaves);
+        const Hash32 root_owner = owner_tree.root();
+        const std::vector<Hash32> owner_proof = owner_tree.proof(0);
+        const std::vector<uint8_t> owner_proof_bytes = proof_to_bytes(owner_proof);
+        const uint8_t* owner_proof_ptr = owner_proof_bytes.empty() ? nullptr : owner_proof_bytes.data();
+
+        State st0;
+        st0.t = 0;
+        st0.root_user = root_user;
+        st0.root_owner = root_owner;
+        st0.sig_der = sig_sign(sig_kp.sk, st0.t, st0.root_user, st0.root_owner);
+
+        mpz_t m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec;
+        mpz_inits(m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec, nullptr);
+        GenerateRandomWithLength(m, 128);
+        GenerateRandomWithLength(m_p, 128);
+        generate_rsa_with_fixed_e(static_cast<unsigned long>(rsa_bits), e1, n2, d2, phi2);
+        GenerateRandomInZnStar(r1, n1);
+        GenerateRandomInZnStar(r2, n2);
+        GenerateRandomInZnStar(k, phi2);
+        GenerateRandomInZnStar(a1, phi2);
+        GenerateRandomInZnStar(a2, phi2);
+        mpz_invert(inv_a1, a1, phi2);
+        mpz_mul(b1, k, inv_a1);
+        mpz_mod(b1, b1, phi2);
+        mpz_invert(inv_a2, a2, phi2);
+        mpz_mul(b2, k, inv_a2);
+        mpz_mod(b2, b2, phi2);
+        mpz_invert(inv_k, k, phi2);
+        mpz_mul(d_dec, d2, inv_k);
+        mpz_mod(d_dec, d_dec, phi2);
+
+        mpz_t h1, h1_m, r1_pow;
+        mpz_t h2, h2_m, r2_pow;
+        mpz_inits(h1, h1_m, r1_pow, h2, h2_m, r2_pow, nullptr);
+        Hgsm_n_2(m, n1, n2, n1, h1_m);
+        mpz_powm(r1_pow, r1, e1, n1);
+        mpz_mul(h1, h1_m, r1_pow);
+        mpz_mod(h1, h1, n1);
+        Hgsm_n_2(m, n1, n2, n2, h2_m);
+        mpz_powm(r2_pow, r2, e1, n2);
+        mpz_mul(h2, h2_m, r2_pow);
+        mpz_mod(h2, h2, n2);
+
+        const std::vector<uint8_t> ibe_ct = ibe_encrypt_pair(pairing, g_kgc.ibe, owner_id_bytes, b1, b2);
+        const std::vector<uint8_t> ibe_ct_base = ibe_encrypt_mpz(pairing, g_kgc.ibe, owner_id_bytes, k);
+
+        const std::vector<uint8_t> n1_bytes = mpz_to_bytes(n1);
+        const std::vector<uint8_t> e1_bytes = mpz_to_bytes(e1);
+        const std::vector<uint8_t> n2_bytes = mpz_to_bytes(n2);
+        const std::vector<uint8_t> m_bytes = mpz_to_bytes(m);
+        const std::vector<uint8_t> mp_bytes = mpz_to_bytes(m_p);
+        const std::vector<uint8_t> h1_bytes = mpz_to_bytes(h1);
+        const std::vector<uint8_t> h2_bytes = mpz_to_bytes(h2);
+        const std::vector<uint8_t> r1_bytes = mpz_to_bytes(r1);
+        const std::vector<uint8_t> r2_bytes = mpz_to_bytes(r2);
+        const std::vector<uint8_t> a1_bytes = mpz_to_bytes(a1);
+        const std::vector<uint8_t> a2_bytes = mpz_to_bytes(a2);
+
+        struct CostCtx {
+            std::unique_ptr<FAME_OD> fame;
+            FAME_OD::TK tk;
+            FAME_OD::DK dk;
+            FAME_OD::ciphertext ct;
+            FAME_OD::TC tc;
+            element_t K;
+            element_t K_rec;
+            mpz_t ct_usr;
+            mpz_t d_dec_rec;
+            mpz_t r2_p;
+            mpz_t pi_mpz;
+            mpz_t r1_p;
+            mpz_t n1, e1, n2, m, m_p, r1, r2, a1, a2, h1, h2;
+            mpz_t h1_mp, inv_h1_mp, mu1;
+            mpz_t x2_mp, x2_p, y2, inv_x2_p, X, mu2_1, mu2_2;
+        };
+
+        struct BaselineCtx {
+            std::unique_ptr<CP_ABE> cpabe;
+            CP_ABE::msk msk;
+            CP_ABE::mpk mpk;
+            CP_ABE::sks sks;
+            CP_ABE::ciphertext ct;
+            element_t K_base;
+            element_t K_rec;
+            mpz_t ct_b2;
+            mpz_t b1;
+            mpz_t b2;
+            mpz_t n1, e1, d1, n2, m, m_p, r1, r2, h1, h2;
+            mpz_t h1_mp, inv_h1_mp, mu1;
+            mpz_t r1_p;
+            mpz_t x2_m, x2_mp, y2, inv_x2_mp, X, pi, r2_p;
+        };
+
+        // For the multi-thread cost benchmark, we interpret --threads as the *server-side* concurrency.
+        // The no-outsourcing baseline has no cloud server, so it cannot benefit from extra server threads.
+        const size_t server_threads = static_cast<size_t>(bench_threads);
+        const size_t effective_threads = (bench_mode == "no_outsource") ? 1 : std::max<size_t>(1, server_threads);
+        // Pipeline depth for HR-PCH: keep enough "in flight" contexts so the server can work while the
+        // TEE stage and user stage are busy (3-stage pipeline). For threads=1, we still want >=3 to
+        // allow overlap without stalling on context reuse.
+        const size_t pipeline_depth = (bench_mode == "hrpch") ? std::max<size_t>(3, effective_threads + 2) : effective_threads;
+
+        std::vector<CostCtx> ctxs;
+        std::vector<BaselineCtx> base_ctxs;
+
+	        if (bench_mode == "hrpch") {
+            ctxs.resize(pipeline_depth);
+            for (size_t i = 0; i < ctxs.size(); i++) {
+                auto& ctx = ctxs[i];
+                ctx.fame.reset(new FAME_OD(&G1, &G2, &GT, &Zp));
+                ctx.tk.Init(&G1, &G2, static_cast<int>(attrs.size()));
+                ctx.dk.Init(&Zp);
+                ctx.fame->KeyGen(&msk_abe, &mpk_abe, const_cast<std::vector<std::string>*>(&attrs), &ctx.tk, &ctx.dk);
+                fame_copy_tk(ctx.tk, tk_shared);
+                fame_copy_dk(ctx.dk, dk_shared);
+
+                ctx.ct.Init(&Zp, &G1, &G2, &GT, policy_attrs);
+                element_init_same_as(ctx.K, GT);
+                element_random(ctx.K);
+                ctx.fame->Encrypt(&mpk_abe, &ctx.K, policy, &ctx.ct);
+                AES aes;
+                mpz_init(ctx.ct_usr);
+                aes.Enc(&ctx.K, &d_dec, &ctx.ct_usr);
+
+                ctx.tc.Init(&Zp, &G1, &G2, &GT);
+                element_init_same_as(ctx.K_rec, GT);
+
+                mpz_init(ctx.d_dec_rec);
+                mpz_init(ctx.r2_p);
+                mpz_init(ctx.pi_mpz);
+                mpz_init(ctx.r1_p);
+                mpz_init(ctx.n1);
+                mpz_init(ctx.e1);
+                mpz_init(ctx.n2);
+                mpz_init(ctx.m);
+                mpz_init(ctx.m_p);
+                mpz_init(ctx.r1);
+                mpz_init(ctx.r2);
+                mpz_init(ctx.a1);
+                mpz_init(ctx.a2);
+                mpz_init(ctx.h1);
+                mpz_init(ctx.h2);
+                mpz_init(ctx.h1_mp);
+                mpz_init(ctx.inv_h1_mp);
+                mpz_init(ctx.mu1);
+                mpz_init(ctx.x2_mp);
+                mpz_init(ctx.x2_p);
+                mpz_init(ctx.y2);
+                mpz_init(ctx.inv_x2_p);
+                mpz_init(ctx.X);
+                mpz_init(ctx.mu2_1);
+                mpz_init(ctx.mu2_2);
+
+                mpz_from_bytes(ctx.n1, n1_bytes.data(), n1_bytes.size());
+                mpz_from_bytes(ctx.e1, e1_bytes.data(), e1_bytes.size());
+                mpz_from_bytes(ctx.n2, n2_bytes.data(), n2_bytes.size());
+                mpz_from_bytes(ctx.m, m_bytes.data(), m_bytes.size());
+                mpz_from_bytes(ctx.m_p, mp_bytes.data(), mp_bytes.size());
+                mpz_from_bytes(ctx.r1, r1_bytes.data(), r1_bytes.size());
+                mpz_from_bytes(ctx.r2, r2_bytes.data(), r2_bytes.size());
+                mpz_from_bytes(ctx.a1, a1_bytes.data(), a1_bytes.size());
+                mpz_from_bytes(ctx.a2, a2_bytes.data(), a2_bytes.size());
+                if (!h1_bytes.empty()) {
+                    mpz_from_bytes(ctx.h1, h1_bytes.data(), h1_bytes.size());
+                }
+                if (!h2_bytes.empty()) {
+                    mpz_from_bytes(ctx.h2, h2_bytes.data(), h2_bytes.size());
+                }
+            }
+        } else if (bench_mode == "no_outsource") {
+            base_ctxs.resize(effective_threads);
+            for (size_t i = 0; i < base_ctxs.size(); i++) {
+                auto& ctx = base_ctxs[i];
+                ctx.cpabe.reset(new CP_ABE(&G1, &G2, &GT, &Zp));
+                ctx.msk.Init(&G1, &G2, &Zp);
+                ctx.mpk.Init(&G2, &GT);
+                ctx.cpabe->Setup(&ctx.msk, &ctx.mpk);
+                ctx.sks.Init(&G1, &G2, static_cast<int>(attrs.size()));
+                ctx.cpabe->KeyGen(&ctx.msk, &ctx.mpk, const_cast<std::vector<std::string>*>(&attrs), &ctx.sks);
+
+                ctx.ct.Init(&G1, &G2, &GT, policy_attrs);
+                element_init_same_as(ctx.K_base, GT);
+                element_random(ctx.K_base);
+                ctx.cpabe->Encrypt(&ctx.mpk, &ctx.K_base, policy, &ctx.ct);
+                element_init_same_as(ctx.K_rec, GT);
+                mpz_init(ctx.ct_b2);
+                AES aes;
+                aes.Enc(&ctx.K_base, &d_dec, &ctx.ct_b2);
+
+                mpz_init(ctx.b1);
+                mpz_init(ctx.b2);
+                mpz_init(ctx.n1);
+                mpz_init(ctx.e1);
+                mpz_init(ctx.d1);
+                mpz_init(ctx.n2);
+                mpz_init(ctx.m);
+                mpz_init(ctx.m_p);
+                mpz_init(ctx.r1);
+                mpz_init(ctx.r2);
+                mpz_init(ctx.h1);
+                mpz_init(ctx.h2);
+                mpz_init(ctx.h1_mp);
+                mpz_init(ctx.inv_h1_mp);
+                mpz_init(ctx.mu1);
+                mpz_init(ctx.r1_p);
+                mpz_init(ctx.x2_m);
+                mpz_init(ctx.x2_mp);
+                mpz_init(ctx.y2);
+                mpz_init(ctx.inv_x2_mp);
+                mpz_init(ctx.X);
+                mpz_init(ctx.pi);
+                mpz_init(ctx.r2_p);
+
+                mpz_from_bytes(ctx.n1, n1_bytes.data(), n1_bytes.size());
+                mpz_from_bytes(ctx.e1, e1_bytes.data(), e1_bytes.size());
+                mpz_from_bytes(ctx.d1, d1_bytes.data(), d1_bytes.size());
+                mpz_from_bytes(ctx.n2, n2_bytes.data(), n2_bytes.size());
+                mpz_from_bytes(ctx.m, m_bytes.data(), m_bytes.size());
+                mpz_from_bytes(ctx.m_p, mp_bytes.data(), mp_bytes.size());
+                mpz_from_bytes(ctx.r1, r1_bytes.data(), r1_bytes.size());
+                mpz_from_bytes(ctx.r2, r2_bytes.data(), r2_bytes.size());
+                if (!h1_bytes.empty()) {
+                    mpz_from_bytes(ctx.h1, h1_bytes.data(), h1_bytes.size());
+                }
+                if (!h2_bytes.empty()) {
+                    mpz_from_bytes(ctx.h2, h2_bytes.data(), h2_bytes.size());
+                }
+            }
+        } else {
+            std::fprintf(stderr, "unknown --mode for cost bench: %s\n", bench_mode.c_str());
+            sgx_destroy_enclave(eid);
+            return 2;
+        }
+
+        const uint32_t user_idx_u = static_cast<uint32_t>(target_idx);
+        const uint32_t owner_idx_u = 0;
+        std::atomic<size_t> failures{0};
+        struct CostJob {
+            size_t ctx_idx = 0;
+            bool ok = true;
+            std::vector<uint8_t> mu1;
+            std::vector<uint8_t> mu21;
+            std::vector<uint8_t> mu22;
+        };
+
+        const uint64_t ts = now_us();
+
+        if (bench_mode == "hrpch") {
+            // Stage A (server): CHET + OABE transform, parallelized by server threads.
+            // Stage B (TEE): enclave insider-adapt (IBE decrypt + checks).
+            // Stage C (user): final OABE decrypt + RSA exp + verify.
+            //
+            // IMPORTANT: TEE-holder and user are different principals; for batched independent requests they can be
+            // pipelined across tasks. We therefore model HR-PCH as a 3-stage pipeline (server -> TEE -> user).
+            std::mutex free_mu;
+            std::condition_variable free_cv;
+            std::vector<size_t> free_ctx;
+            free_ctx.reserve(ctxs.size());
+            for (size_t i = 0; i < ctxs.size(); i++) {
+                free_ctx.push_back(i);
+            }
+
+            std::mutex q_mu;
+            std::condition_variable q_cv;
+            std::deque<CostJob> q;
+
+            struct UserJob {
+                size_t ctx_idx = 0;
+                bool ok = true;
+                std::vector<uint8_t> r1p;
+                std::vector<uint8_t> pi;
+            };
+            std::mutex q2_mu;
+            std::condition_variable q2_cv;
+            std::deque<UserJob> q2;
+
+            std::atomic<size_t> next_task{0};
+
+            auto server_worker = [&]() {
+                for (;;) {
+                    const size_t idx_task = next_task.fetch_add(1);
+                    if (idx_task >= static_cast<size_t>(bench_tasks)) {
+                        break;
+                    }
+
+                    size_t ctx_idx = 0;
+                    {
+                        std::unique_lock<std::mutex> lock(free_mu);
+                        free_cv.wait(lock, [&]() { return !free_ctx.empty(); });
+                        ctx_idx = free_ctx.back();
+                        free_ctx.pop_back();
+                    }
+
+                    auto& ctx = ctxs[ctx_idx];
+
+                    // --- Server-side CHET: compute μ ---
+                    Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n1, ctx.h1_mp);
+                    mpz_invert(ctx.inv_h1_mp, ctx.h1_mp, ctx.n1);
+                    mpz_mul(ctx.mu1, ctx.h1, ctx.inv_h1_mp);
+                    mpz_mod(ctx.mu1, ctx.mu1, ctx.n1);
+
+                    Hgsm_n_2(ctx.m, ctx.n1, ctx.n2, ctx.n2, ctx.x2_mp);
+                    Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n2, ctx.x2_p);
+                    mpz_powm(ctx.y2, ctx.r2, ctx.e1, ctx.n2);
+                    mpz_mul(ctx.y2, ctx.x2_mp, ctx.y2);
+                    mpz_mod(ctx.y2, ctx.y2, ctx.n2);
+                    mpz_invert(ctx.inv_x2_p, ctx.x2_p, ctx.n2);
+                    mpz_mul(ctx.X, ctx.y2, ctx.inv_x2_p);
+                    mpz_mod(ctx.X, ctx.X, ctx.n2);
+                    mpz_powm(ctx.mu2_1, ctx.X, ctx.a1, ctx.n2);
+                    mpz_powm(ctx.mu2_2, ctx.X, ctx.a2, ctx.n2);
+
+                    CostJob job;
+                    job.ctx_idx = ctx_idx;
+                    try {
+                        job.mu1 = mpz_to_bytes(ctx.mu1);
+                        job.mu21 = mpz_to_bytes(ctx.mu2_1);
+                        job.mu22 = mpz_to_bytes(ctx.mu2_2);
+
+                        // --- Server-side OABE transform -> τ ---
+                        ctx.fame->Transform(&mpk_abe, &ctx.ct, &ctx.tk, &ctx.tc);
+                    } catch (...) {
+                        // Keep pipeline progress; let the user stage count this task as failed.
+                        job.ok = false;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(q_mu);
+                        q.emplace_back(std::move(job));
+                    }
+                    q_cv.notify_one();
+                }
+            };
+
+            auto tee_worker = [&]() {
+                for (size_t done = 0; done < static_cast<size_t>(bench_tasks); done++) {
+                    CostJob job;
+                    {
+                        std::unique_lock<std::mutex> lock(q_mu);
+                        q_cv.wait(lock, [&]() { return !q.empty(); });
+                        job = std::move(q.front());
+                        q.pop_front();
+                    }
+
+                    UserJob out;
+                    out.ctx_idx = job.ctx_idx;
+                    out.ok = job.ok;
+
+                    if (job.ok) {
+                        std::vector<uint8_t> r1p_buf(512);
+                        std::vector<uint8_t> pi_buf(512);
+                        uint32_t r1p_len = 0;
+                        uint32_t pi_len = 0;
+                        int local_ret = -1;
+
+                        const sgx_status_t rc = ecall_hrpch_insider_adapt(
+                            eid,
+                            &local_ret,
+                            st0.t,
+                            const_cast<uint8_t*>(st0.root_user.data()),
+                            const_cast<uint8_t*>(st0.root_owner.data()),
+                            const_cast<uint8_t*>(st0.sig_der.data()),
+                            st0.sig_der.size(),
+                            user_id.c_str(),
+                            user_idx_u,
+                            const_cast<uint8_t*>(user_tk_bytes.data()),
+                            static_cast<uint32_t>(user_tk_bytes.size()),
+                            const_cast<uint8_t*>(user_proof_ptr),
+                            static_cast<uint32_t>(user_proof_bytes.size()),
+                            owner_id.c_str(),
+                            owner_idx_u,
+                            const_cast<uint8_t*>(owner_enc_sk.data()),
+                            static_cast<uint32_t>(owner_enc_sk.size()),
+                            const_cast<uint8_t*>(owner_proof_ptr),
+                            static_cast<uint32_t>(owner_proof_bytes.size()),
+                            const_cast<uint8_t*>(n1_bytes.data()),
+                            n1_bytes.size(),
+                            const_cast<uint8_t*>(e1_bytes.data()),
+                            e1_bytes.size(),
+                            const_cast<uint8_t*>(n2_bytes.data()),
+                            n2_bytes.size(),
+                            const_cast<uint8_t*>(m_bytes.data()),
+                            m_bytes.size(),
+                            const_cast<uint8_t*>(mp_bytes.data()),
+                            mp_bytes.size(),
+                            const_cast<uint8_t*>(h1_bytes.data()),
+                            h1_bytes.size(),
+                            const_cast<uint8_t*>(job.mu1.data()),
+                            static_cast<uint32_t>(job.mu1.size()),
+                            const_cast<uint8_t*>(job.mu21.data()),
+                            static_cast<uint32_t>(job.mu21.size()),
+                            const_cast<uint8_t*>(job.mu22.data()),
+                            static_cast<uint32_t>(job.mu22.size()),
+                            const_cast<uint8_t*>(ibe_ct.data()),
+                            static_cast<uint32_t>(ibe_ct.size()),
+                            r1p_buf.data(),
+                            static_cast<uint32_t>(r1p_buf.size()),
+                            &r1p_len,
+                            pi_buf.data(),
+                            static_cast<uint32_t>(pi_buf.size()),
+                            &pi_len);
+
+                        if (rc != SGX_SUCCESS || local_ret != 0) {
+                            out.ok = false;
+                        } else {
+                            r1p_buf.resize(r1p_len);
+                            pi_buf.resize(pi_len);
+                            if (r1p_buf.empty() || pi_buf.empty()) {
+                                out.ok = false;
+                            } else {
+                                out.r1p = std::move(r1p_buf);
+                                out.pi = std::move(pi_buf);
+                            }
+                        }
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(q2_mu);
+                        q2.emplace_back(std::move(out));
+                    }
+                    q2_cv.notify_one();
+                }
+            };
+
+            auto user_worker = [&]() {
+                AES aes;
+                for (size_t done = 0; done < static_cast<size_t>(bench_tasks); done++) {
+                    UserJob job;
+                    {
+                        std::unique_lock<std::mutex> lock(q2_mu);
+                        q2_cv.wait(lock, [&]() { return !q2.empty(); });
+                        job = std::move(q2.front());
+                        q2.pop_front();
+                    }
+
+                    auto& ctx = ctxs[job.ctx_idx];
+
+                    bool ok = job.ok;
+                    if (ok) {
+                        try {
+                            mpz_from_bytes(ctx.r1_p, job.r1p.data(), job.r1p.size());
+                            mpz_from_bytes(ctx.pi_mpz, job.pi.data(), job.pi.size());
+
+                            ctx.fame->Decrypt(&mpk_abe, &ctx.tc, &ctx.dk, &ctx.K_rec);
+                            aes.Dec(&ctx.K_rec, &ctx.ct_usr, &ctx.d_dec_rec);
+                            mpz_powm(ctx.r2_p, ctx.pi_mpz, ctx.d_dec_rec, ctx.n2);
+                            ok = tpch_check(ctx.n1, ctx.e1, ctx.n2, ctx.m_p, ctx.h1, ctx.h2, ctx.r1_p, ctx.r2_p);
+                        } catch (...) {
+                            ok = false;
+                        }
+                    }
+                    if (!ok) {
+                        failures.fetch_add(1);
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(free_mu);
+                        free_ctx.push_back(job.ctx_idx);
+                    }
+                    free_cv.notify_one();
+                }
+            };
+
+            std::vector<std::thread> th_server;
+            th_server.reserve(effective_threads);
+            for (size_t i = 0; i < effective_threads; i++) {
+                th_server.emplace_back(server_worker);
+            }
+
+            std::thread th_tee(tee_worker);
+            std::thread th_user(user_worker);
+
+	            for (auto& th : th_server) {
+	                th.join();
+	            }
+	            th_tee.join();
+                th_user.join();
+	        } else {
+	            // No-outsourcing baseline: pipeline TEE (Part1Adapt) and user (Part2/Part3Adapt) across tasks.
+	            //
+	            // IMPORTANT: Our HR-PCH cost bench overlaps server-stage work with TEE+user work.
+	            // If we serialize the baseline end-to-end, it unfairly penalizes it and can invert the
+	            // expected "threads=1" ordering. This pipeline reflects the real two-party execution
+	            // (TEE-holder vs user) across independent requests.
+	            struct BaseJob {
+	                bool ok = false;
+	                std::vector<uint8_t> r1p;
+	                std::vector<uint8_t> pi;
+	            };
+	            std::mutex q_mu;
+	            std::condition_variable q_cv;
+	            std::deque<BaseJob> q;
+	            bool tee_done = false;
+
+	            auto tee_worker = [&]() {
+	                for (size_t i = 0; i < static_cast<size_t>(bench_tasks); i++) {
+	                    BaseJob job;
+	                    std::vector<uint8_t> r1p_buf(512);
+	                    std::vector<uint8_t> pi_buf(512);
+	                    uint32_t r1p_len = 0;
+	                    uint32_t pi_len = 0;
+	                    int local_ret = -1;
+	                    const sgx_status_t rc = ecall_hrpch_insider_adapt_no_outsource(
+	                        eid,
+	                        &local_ret,
+	                        owner_id.c_str(),
+	                        const_cast<uint8_t*>(owner_enc_sk.data()),
+	                        static_cast<uint32_t>(owner_enc_sk.size()),
+	                        const_cast<uint8_t*>(n1_bytes.data()),
+	                        n1_bytes.size(),
+	                        const_cast<uint8_t*>(e1_bytes.data()),
+	                        e1_bytes.size(),
+	                        const_cast<uint8_t*>(n2_bytes.data()),
+	                        n2_bytes.size(),
+	                        const_cast<uint8_t*>(m_bytes.data()),
+	                        m_bytes.size(),
+	                        const_cast<uint8_t*>(mp_bytes.data()),
+	                        mp_bytes.size(),
+	                        const_cast<uint8_t*>(h1_bytes.data()),
+	                        h1_bytes.size(),
+	                        const_cast<uint8_t*>(r1_bytes.data()),
+	                        r1_bytes.size(),
+	                        const_cast<uint8_t*>(r2_bytes.data()),
+	                        r2_bytes.size(),
+	                        const_cast<uint8_t*>(a1_bytes.data()),
+	                        a1_bytes.size(),
+	                        const_cast<uint8_t*>(a2_bytes.data()),
+	                        a2_bytes.size(),
+	                        const_cast<uint8_t*>(ibe_ct_base.data()),
+	                        static_cast<uint32_t>(ibe_ct_base.size()),
+	                        r1p_buf.data(),
+	                        static_cast<uint32_t>(r1p_buf.size()),
+	                        &r1p_len,
+	                        pi_buf.data(),
+	                        static_cast<uint32_t>(pi_buf.size()),
+	                        &pi_len);
+
+	                    if (rc == SGX_SUCCESS && local_ret == 0 && pi_len > 0) {
+	                        r1p_buf.resize(r1p_len);
+	                        pi_buf.resize(pi_len);
+	                        job.ok = !r1p_buf.empty() && !pi_buf.empty();
+	                        if (job.ok) {
+	                            job.r1p = std::move(r1p_buf);
+	                            job.pi = std::move(pi_buf);
+	                        } else {
+	                            failures.fetch_add(1);
+	                        }
+	                    } else {
+	                        failures.fetch_add(1);
+	                    }
+
+	                    {
+	                        std::lock_guard<std::mutex> lock(q_mu);
+	                        q.emplace_back(std::move(job));
+	                    }
+	                    q_cv.notify_one();
+	                }
+	                {
+	                    std::lock_guard<std::mutex> lock(q_mu);
+	                    tee_done = true;
+	                }
+	                q_cv.notify_all();
+	            };
+
+	            auto user_worker = [&]() {
+	                auto& ctx = base_ctxs[0];
+	                AES aes;
+	                for (size_t done = 0; done < static_cast<size_t>(bench_tasks); done++) {
+	                    BaseJob job;
+	                    {
+	                        std::unique_lock<std::mutex> lock(q_mu);
+	                        q_cv.wait(lock, [&]() { return !q.empty() || tee_done; });
+	                        if (q.empty()) {
+	                            failures.fetch_add(1);
+	                            continue;
+	                        }
+	                        job = std::move(q.front());
+	                        q.pop_front();
+	                    }
+
+	                    if (!job.ok) {
+	                        continue;
+	                    }
+
+	                    mpz_from_bytes(ctx.r1_p, job.r1p.data(), job.r1p.size());
+	                    mpz_from_bytes(ctx.pi, job.pi.data(), job.pi.size());
+
+	                    try {
+	                        ctx.cpabe->Decrypt(&ctx.mpk, &ctx.ct, &ctx.sks, &ctx.K_rec);
+	                        aes.Dec(&ctx.K_rec, &ctx.ct_b2, &ctx.b2);
+	                    } catch (...) {
+	                        failures.fetch_add(1);
+	                        continue;
+	                    }
+
+	                    mpz_powm(ctx.r2_p, ctx.pi, ctx.b2, ctx.n2);
+	                    if (!tpch_check(ctx.n1, ctx.e1, ctx.n2, ctx.m_p, ctx.h1, ctx.h2, ctx.r1_p, ctx.r2_p)) {
+	                        failures.fetch_add(1);
+	                    }
+	                }
+	            };
+
+	            std::thread th_tee(tee_worker);
+	            std::thread th_user(user_worker);
+	            th_tee.join();
+	            th_user.join();
+	        }
+
+        const uint64_t te = now_us();
+
+        const double elapsed_ms = static_cast<double>(te - ts) / 1000.0;
+        const size_t total_ops = bench_tasks;
+
+        std::ostringstream js;
+        js << "{\n";
+        js << "  \"params\": {\n";
+        js << "    \"bench\": \"cost\",\n";
+        js << "    \"mode\": \"" << json_escape(bench_mode) << "\",\n";
+        js << "    \"dlo_version\": \"" << kDloVersion << "\",\n";
+        js << "    \"curve\": \"" << json_escape(curve) << "\",\n";
+        js << "    \"rsa_bits\": " << rsa_bits << ",\n";
+        js << "    \"attrs\": " << attrs.size() << ",\n";
+        js << "    \"policy\": \"" << json_escape(policy) << "\",\n";
+        js << "    \"policy_attrs\": " << policy_attrs << ",\n";
+        js << "    \"user_count\": " << user_count << ",\n";
+        js << "    \"threads\": " << bench_threads << ",\n";
+        js << "    \"tasks\": " << bench_tasks << "\n";
+        js << "  },\n";
+        js << "  \"results\": {\n";
+        js << "    \"total_ops\": " << total_ops << ",\n";
+        js << "    \"elapsed_ms\": " << elapsed_ms << ",\n";
+        js << "    \"failures\": " << failures.load() << "\n";
+        js << "  }\n";
+        js << "}\n";
+
+        {
+            std::ofstream out(out_path, std::ios::binary);
+            out << js.str();
+        }
+
+        for (auto& ctx : ctxs) {
+            element_clear(ctx.K);
+            element_clear(ctx.K_rec);
+            mpz_clears(ctx.ct_usr, ctx.d_dec_rec, ctx.r2_p, ctx.pi_mpz, nullptr);
+            mpz_clears(ctx.r1_p, nullptr);
+            mpz_clears(ctx.n1, ctx.e1, ctx.n2, ctx.m, ctx.m_p, ctx.r1, ctx.r2, ctx.a1, ctx.a2, ctx.h1, ctx.h2, nullptr);
+            mpz_clears(ctx.h1_mp, ctx.inv_h1_mp, ctx.mu1, nullptr);
+            mpz_clears(ctx.x2_mp, ctx.x2_p, ctx.y2, ctx.inv_x2_p, ctx.X, ctx.mu2_1, ctx.mu2_2, nullptr);
+        }
+        for (auto& ctx : base_ctxs) {
+            element_clear(ctx.K_base);
+            element_clear(ctx.K_rec);
+            mpz_clears(ctx.ct_b2, ctx.b1, ctx.b2, nullptr);
+            mpz_clears(ctx.n1, ctx.e1, ctx.d1, ctx.n2, ctx.m, ctx.m_p, ctx.r1, ctx.r2, ctx.h1, ctx.h2, nullptr);
+            mpz_clears(ctx.h1_mp, ctx.inv_h1_mp, ctx.mu1, nullptr);
+            mpz_clears(ctx.r1_p, nullptr);
+            mpz_clears(ctx.x2_m, ctx.x2_mp, ctx.y2, ctx.inv_x2_mp, ctx.X, ctx.pi, ctx.r2_p, nullptr);
+        }
+
+        sgx_destroy_enclave(eid);
+        EVP_PKEY_free(sig_kp.sk);
+        EVP_PKEY_free(sig_kp.vk);
+        ibe_clear(g_kgc.ibe);
+
+        mpz_clears(n1, e1, d1, phi1, nullptr);
+        mpz_clears(m, m_p, n2, d2, phi2, r1, r2, k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec, nullptr);
+        mpz_clears(h1, h1_m, r1_pow, h2, h2_m, r2_pow, nullptr);
+
+        return 0;
+    }
+
+    // ---------- Metrics ----------
+    std::map<std::string, double> t_ms;
+    std::map<std::string, size_t> s_bytes;
+    bool ok_new = false;
+    int exit_code = 0;
+
+    {
+        // ---------- Setup (KGC) ----------
+        mpz_t n1, e1, d1, phi1;
+        mpz_inits(n1, e1, d1, phi1, nullptr);
+
+        FAME_OD fame(&G1, &G2, &GT, &Zp);
+        FAME_OD::msk msk_abe;
+        FAME_OD::mpk mpk_abe;
+        msk_abe.Init(&G1, &G2, &Zp);
+        mpk_abe.Init(&G2, &GT);
+
+        const uint64_t ts_setup = now_us();
+        {
+            MyRSA rsa(&n1, &e1, &d1);
+            rsa.rsa_generate_keys_2(rsa_bits, 1, &phi1);
+            fame.Setup(&msk_abe, &mpk_abe);
+            g_kgc.ibe = ibe_setup(pairing);
+        }
+        const uint64_t te_setup = now_us();
+        t_ms["Setup(KGC)"] = (te_setup - ts_setup) / 1000.0;
+
+        SigKeyPair sig_kp = sig_keygen();
+
+        // sizes (theoretical/actual)
+        s_bytes["pk.N1"] = mpz_bytes(n1);
+        s_bytes["pk.e1"] = mpz_bytes(e1);
+        s_bytes["pk.mpkABE"] = fame_mpk_bytes(mpk_abe);
+        s_bytes["pk.IBE_Ppub"] = ibe_pub_bytes(g_kgc.ibe).size();
+        s_bytes["pk.vk_sig"] = sig_kp.vk_der.size();
+
+        // ---------- SGX enclave create + provision ----------
+        sgx_enclave_id_t eid = 0;
+        sgx_launch_token_t token = {0};
+        int updated = 0;
+        const char* enclave_path = "enclave.signed.so";
+        sgx_status_t st = sgx_create_enclave(enclave_path, SGX_DEBUG_FLAG, &token, &updated, &eid, nullptr);
+        if (st != SGX_SUCCESS) {
+            std::printf("sgx_create_enclave failed: 0x%x\n", st);
+            return 2;
+        }
+
+        const std::vector<uint8_t> d1_bytes = mpz_to_bytes(d1);
+        Hash32 ktee_key{};
+        RAND_bytes(ktee_key.data(), ktee_key.size());
+        int ecall_ret = -1;
+        st = ecall_provision(eid, &ecall_ret, const_cast<uint8_t*>(d1_bytes.data()), d1_bytes.size(),
+                             ktee_key.data(), ktee_key.size(),
+                             const_cast<uint8_t*>(sig_kp.vk_der.data()), sig_kp.vk_der.size(),
+                             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(param.c_str())),
+                             static_cast<uint32_t>(param.size() + 1));
+        if (st != SGX_SUCCESS || ecall_ret != 0) {
+            std::printf("ecall_provision failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            sgx_destroy_enclave(eid);
+            return 3;
+        }
+
+        // ---------- User KeyGen (KGC -> User) ----------
+        if (attr_count < 1) attr_count = 1;
+        if (policy_attrs < 1) policy_attrs = 1;
+        if (policy_attrs > attr_count) policy_attrs = attr_count;
+        const std::vector<std::string> attrs = make_attr_list(attr_count);
+        FAME_OD::TK tk;
+        FAME_OD::DK dk;
+        tk.Init(&G1, &G2, static_cast<int>(attrs.size()));
+        dk.Init(&Zp);
+
+        const uint64_t ts_keygen = now_us();
+        fame.KeyGen(&msk_abe, &mpk_abe, const_cast<std::vector<std::string>*>(&attrs), &tk, &dk);
+        const uint64_t te_keygen = now_us();
+        const double keygen_ms = (te_keygen - ts_keygen) / 1000.0;
+        s_bytes["sk.DK_U"] = fame_dk_bytes(dk);
+        s_bytes["tk.TK_U"] = fame_tk_bytes(tk);
+
+        // ---------- State init (Merkle roots for user TK + owner sk_id) ----------
+        if (user_count < 1) {
+            user_count = 1024;
+        }
+        const size_t target_idx = user_count / 2;
+        const std::string user_id = make_user_id(target_idx);
+        const std::vector<uint8_t> do_id_bytes(do_id.begin(), do_id.end());
+        const std::string owner_id = do_id;
+
+        const std::vector<uint8_t> user_tk_bytes = fame_tk_bytes_vec(tk);
+        std::vector<Hash32> user_leaves;
+        user_leaves.reserve(user_count);
+        for (size_t i = 0; i < user_count; i++) {
+            const std::string uid = make_user_id(i);
+            const std::vector<uint8_t> tk_bytes =
+                (i == target_idx) ? user_tk_bytes : random_bytes_vec(user_tk_bytes.size());
+            user_leaves.push_back(hash_user_leaf(uid, tk_bytes));
+        }
+        const MerkleTree user_tree = build_merkle_tree(user_leaves);
+        const Hash32 root_user = user_tree.root();
+        const std::vector<Hash32> user_proof = user_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> user_proof_bytes = proof_to_bytes(user_proof);
+
+        const uint64_t ts_keyextract = now_us();
+        const std::vector<uint8_t> owner_sk = ibe_extract(pairing, g_kgc.ibe, do_id_bytes);
+        const uint64_t te_keyextract = now_us();
+        const double keyextract_ms = (te_keyextract - ts_keyextract) / 1000.0;
+        t_ms["KeyExtract(Owner)"] = keyextract_ms;
+        t_ms["KeyGen(User)"] = keygen_ms + keyextract_ms;
+        const std::vector<uint8_t> owner_enc_sk = aes256_gcm_encrypt_packed(
+            ktee_key.data(),
+            do_id_bytes.data(),
+            static_cast<uint32_t>(do_id_bytes.size()),
+            owner_sk.data(),
+            static_cast<uint32_t>(owner_sk.size()));
+        std::vector<Hash32> owner_leaves;
+        owner_leaves.push_back(hash_owner_leaf(owner_id, owner_enc_sk));
+        const MerkleTree owner_tree = build_merkle_tree(owner_leaves);
+        const Hash32 root_owner = owner_tree.root();
+        const std::vector<Hash32> owner_proof = owner_tree.proof(0);
+        const std::vector<uint8_t> owner_proof_bytes = proof_to_bytes(owner_proof);
+
+        State st0;
+        st0.t = 0;
+        st0.root_user = root_user;
+        st0.root_owner = root_owner;
+        st0.sig_der = sig_sign(sig_kp.sk, st0.t, st0.root_user, st0.root_owner);
+
+        s_bytes["state.root_user_bytes"] = root_user.size();
+        s_bytes["state.root_owner_bytes"] = root_owner.size();
+        s_bytes["state.user_proof_bytes"] = user_proof_bytes.size();
+        s_bytes["state.owner_proof_bytes"] = owner_proof_bytes.size();
+        s_bytes["state.user_leaf_bytes"] = 1 + 4 + user_id.size() + 4 + user_tk_bytes.size();
+        s_bytes["state.owner_leaf_bytes"] = 1 + 4 + owner_id.size() + owner_enc_sk.size();
+        s_bytes["state.owner_enc_sk_bytes"] = owner_enc_sk.size();
+
+        // ---------- DataOwner Hash ----------
+        const std::string policy = make_policy_from_attrs(attrs, policy_attrs, policy_mode);
+        const int rows = policy_attrs;
+
+        Tx tx;
+        tx.Init(&Zp, &GT, &G1, &G2, rows);
+        GenerateRandomWithLength(tx.m, 128);
+
+        mpz_t m_p;
+        mpz_init(m_p);
+        GenerateRandomWithLength(m_p, 128);
+
+        mpz_t n2, d2, phi2;
+        mpz_inits(n2, d2, phi2, nullptr);
+
+        mpz_t r1, r2;
+        mpz_inits(r1, r2, nullptr);
+
+        mpz_t k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec;
+        mpz_inits(k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec, nullptr);
+
+        AES aes;
+        tx.label = owner_id;
+
+        const uint64_t ts_hash = now_us();
+        // generate N2 with fixed e1
+        generate_rsa_with_fixed_e(static_cast<unsigned long>(rsa_bits), e1, n2, d2, phi2);
+        mpz_set(tx.n2, n2);
+
+        GenerateRandomInZnStar(r1, n1);
+        GenerateRandomInZnStar(r2, n2);
+        mpz_set(tx.r1, r1);
+        mpz_set(tx.r2, r2);
+
+        mpz_t x1, x2, tmp, pow;
+        mpz_inits(x1, x2, tmp, pow, nullptr);
+        Hgsm_n_2(tx.m, n1, n2, n1, x1);
+        mpz_powm(pow, r1, e1, n1);
+        mpz_mul(tmp, x1, pow);
+        mpz_mod(tx.h1, tmp, n1);
+
+        Hgsm_n_2(tx.m, n1, n2, n2, x2);
+        mpz_powm(pow, r2, e1, n2);
+        mpz_mul(tmp, x2, pow);
+        mpz_mod(tx.h2, tmp, n2);
+
+        // tx_id = SHA256(h1||h2)
+        const auto h1_bytes = mpz_to_bytes(tx.h1);
+        const auto h2_bytes = mpz_to_bytes(tx.h2);
+        tx.tx_id = sha256_concat(h1_bytes, h2_bytes);
+
+        // k, a1, a2 <- Z_phi(N2)^*, b1 = k * a1^{-1}, b2 = k * a2^{-1}
+        GenerateRandomInZnStar(k, phi2);
+        GenerateRandomInZnStar(a1, phi2);
+        GenerateRandomInZnStar(a2, phi2);
+        mpz_invert(inv_a1, a1, phi2);
+        mpz_mul(b1, k, inv_a1);
+        mpz_mod(b1, b1, phi2);
+        mpz_invert(inv_a2, a2, phi2);
+        mpz_mul(b2, k, inv_a2);
+        mpz_mod(b2, b2, phi2);
+        mpz_invert(inv_k, k, phi2);
+        mpz_mul(d_dec, d2, inv_k);
+        mpz_mod(d_dec, d_dec, phi2);
+
+        mpz_set(tx.a1, a1);
+        mpz_set(tx.a2, a2);
+
+        // OABE: encrypt random K, and ct_usr = AES(K, d_dec)
+        element_random(tx.K);
+        fame.Encrypt(&mpk_abe, &tx.K, policy, &tx.c_oabe);
+        aes.Enc(&tx.K, &d_dec, &tx.ct_usr);
+
+        // IBE: encrypt (b1, b2) under DataOwner id (instead of tx_id hash)
+        tx.ibe_ct = ibe_encrypt_pair(pairing, g_kgc.ibe, do_id_bytes, b1, b2);
+
+        mpz_clears(x1, x2, tmp, pow, nullptr);
+        const uint64_t te_hash = now_us();
+        t_ms["Hash(DO)"] = (te_hash - ts_hash) / 1000.0;
+
+        // storage for tx
+        s_bytes["h.h1"] = mpz_bytes(tx.h1);
+        s_bytes["h.h2"] = mpz_bytes(tx.h2);
+        s_bytes["h.N2"] = mpz_bytes(tx.n2);
+        s_bytes["h.a1"] = mpz_bytes(tx.a1);
+        s_bytes["h.a2"] = mpz_bytes(tx.a2);
+        s_bytes["h.L"] = tx.label.size();
+        s_bytes["h.IBE_ct"] = tx.ibe_ct.size();
+        s_bytes["h.OABE_ct(K)"] = fame_ciphertext_bytes(tx.c_oabe);
+        s_bytes["h.ct_usr"] = mpz_bytes(tx.ct_usr);
+        s_bytes["r.r1"] = mpz_bytes(tx.r1);
+        s_bytes["r.r2"] = mpz_bytes(tx.r2);
+
+        // Verify
+        const uint64_t ts_verify = now_us();
+        const bool ok_hash = tpch_check(n1, e1, n2, tx.m, tx.h1, tx.h2, r1, r2);
+        const uint64_t te_verify = now_us();
+        t_ms["Verify"] = (te_verify - ts_verify) / 1000.0;
+        if (!ok_hash) {
+            std::printf("Verify failed (hash)\n");
+            sgx_destroy_enclave(eid);
+            return 4;
+        }
+
+        // ---------- ServerAdapt ----------
+        mpz_t h1_mp, inv_h1_mp, mu1;
+        mpz_t x2_mp, x2_p, y2, inv_x2_p, X, mu2_1, mu2_2;
+        mpz_inits(h1_mp, inv_h1_mp, mu1, x2_mp, x2_p, y2, inv_x2_p, X, mu2_1, mu2_2, nullptr);
+
+        const uint64_t ts_srv = now_us();
+        Hgsm_n_2(m_p, n1, n2, n1, h1_mp);
+        mpz_invert(inv_h1_mp, h1_mp, n1);
+        mpz_mul(mu1, tx.h1, inv_h1_mp);
+        mpz_mod(mu1, mu1, n1);
+
+        Hgsm_n_2(tx.m, n1, n2, n2, x2_mp);
+        Hgsm_n_2(m_p, n1, n2, n2, x2_p);
+        mpz_powm(y2, r2, e1, n2);
+        mpz_mul(y2, x2_mp, y2);
+        mpz_mod(y2, y2, n2);
+        mpz_invert(inv_x2_p, x2_p, n2);
+        mpz_mul(X, y2, inv_x2_p);
+        mpz_mod(X, X, n2);
+        mpz_powm(mu2_1, X, a1, n2);
+        mpz_powm(mu2_2, X, a2, n2);
+        const uint64_t te_srv_chet = now_us();
+        t_ms["ServerAdapt.CHET"] = (te_srv_chet - ts_srv) / 1000.0;
+
+        // OABE transform -> tau (TC)
+        FAME_OD::TC tc;
+        tc.Init(&Zp, &G1, &G2, &GT);
+        const uint64_t ts_srv_oabe = now_us();
+        fame.Transform(&mpk_abe, &tx.c_oabe, &tk, &tc);
+        const uint64_t te_srv = now_us();
+        t_ms["ServerAdapt.OABE"] = (te_srv - ts_srv_oabe) / 1000.0;
+        t_ms["ServerAdapt"] = (te_srv - ts_srv) / 1000.0;
+        s_bytes["tau.TC"] = fame_tc_bytes(tc);
+
+        // ---------- ABE decryption: outsourced vs non-outsourced (user-side baseline) ----------
+        // Outsourced mode (in protocol): server produces TC, user runs Decrypt(TC, DK).
+        // Non-outsourced baseline: user runs Transform+Decrypt locally.
+        {
+            FAME_OD::TC tc_u;
+            tc_u.Init(&Zp, &G1, &G2, &GT);
+
+            element_t K_u;
+            element_init_same_as(K_u, GT);
+
+            const uint64_t ts_no = now_us();
+            fame.Transform(&mpk_abe, &tx.c_oabe, &tk, &tc_u);
+            fame.Decrypt(&mpk_abe, &tc_u, &dk, &K_u);
+            const uint64_t te_no = now_us();
+            t_ms["ABE.Dec(NoOutsource,User)"] = (te_no - ts_no) / 1000.0;
+
+            element_clear(K_u);
+        }
+
+        // ---------- TEE InsiderAdapt (Enclave) ----------
+        const std::vector<uint8_t> n1_bytes = mpz_to_bytes(n1);
+        const std::vector<uint8_t> e1_bytes = mpz_to_bytes(e1);
+        const std::vector<uint8_t> n2_bytes = mpz_to_bytes(n2);
+        const std::vector<uint8_t> m_bytes = mpz_to_bytes(tx.m);
+        const std::vector<uint8_t> mp_bytes = mpz_to_bytes(m_p);
+        const std::vector<uint8_t> r1_bytes = mpz_to_bytes(r1);
+        const std::vector<uint8_t> r2_bytes = mpz_to_bytes(r2);
+        const std::vector<uint8_t> mu1_bytes = mpz_to_bytes(mu1);
+        const std::vector<uint8_t> mu21_bytes = mpz_to_bytes(mu2_1);
+        const std::vector<uint8_t> mu22_bytes = mpz_to_bytes(mu2_2);
+        const std::vector<uint8_t> a1_bytes = mpz_to_bytes(a1);
+        const std::vector<uint8_t> a2_bytes = mpz_to_bytes(a2);
+
+        std::vector<uint8_t> r1p_buf(512);
+        std::vector<uint8_t> pi_buf(512);
+        uint32_t r1p_len = 0;
+        uint32_t pi_len = 0;
+        const uint8_t* user_proof_ptr = user_proof_bytes.empty() ? nullptr : user_proof_bytes.data();
+        const uint8_t* owner_proof_ptr = owner_proof_bytes.empty() ? nullptr : owner_proof_bytes.data();
+        const uint32_t user_idx_u = static_cast<uint32_t>(target_idx);
+        const uint32_t owner_idx_u = 0;
+
+        const uint64_t ts_tee = now_us();
+        ecall_ret = -1;
+        st = ecall_hrpch_insider_adapt(
+            eid,
+            &ecall_ret,
+            st0.t,
+            const_cast<uint8_t*>(st0.root_user.data()),
+            const_cast<uint8_t*>(st0.root_owner.data()),
+            const_cast<uint8_t*>(st0.sig_der.data()),
+            st0.sig_der.size(),
+            user_id.c_str(),
+            user_idx_u,
+            const_cast<uint8_t*>(user_tk_bytes.data()),
+            static_cast<uint32_t>(user_tk_bytes.size()),
+            const_cast<uint8_t*>(user_proof_ptr),
+            static_cast<uint32_t>(user_proof_bytes.size()),
+            owner_id.c_str(),
+            owner_idx_u,
+            const_cast<uint8_t*>(owner_enc_sk.data()),
+            static_cast<uint32_t>(owner_enc_sk.size()),
+            const_cast<uint8_t*>(owner_proof_ptr),
+            static_cast<uint32_t>(owner_proof_bytes.size()),
+            const_cast<uint8_t*>(n1_bytes.data()),
+            n1_bytes.size(),
+            const_cast<uint8_t*>(e1_bytes.data()),
+            e1_bytes.size(),
+            const_cast<uint8_t*>(n2_bytes.data()),
+            n2_bytes.size(),
+            const_cast<uint8_t*>(m_bytes.data()),
+            m_bytes.size(),
+            const_cast<uint8_t*>(mp_bytes.data()),
+            mp_bytes.size(),
+            const_cast<uint8_t*>(h1_bytes.data()),
+            h1_bytes.size(),
+            const_cast<uint8_t*>(mu1_bytes.data()),
+            mu1_bytes.size(),
+            const_cast<uint8_t*>(mu21_bytes.data()),
+            mu21_bytes.size(),
+            const_cast<uint8_t*>(mu22_bytes.data()),
+            mu22_bytes.size(),
+            const_cast<uint8_t*>(tx.ibe_ct.data()),
+            tx.ibe_ct.size(),
+            r1p_buf.data(),
+            r1p_buf.size(),
+            &r1p_len,
+            pi_buf.data(),
+            pi_buf.size(),
+            &pi_len);
+        const uint64_t te_tee = now_us();
+        t_ms["InsiderAdapt(TEE)"] = (te_tee - ts_tee) / 1000.0;
+
+        if (st != SGX_SUCCESS || ecall_ret != 0) {
+            std::printf("ecall_hrpch_insider_adapt failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            sgx_destroy_enclave(eid);
+            return 5;
+        }
+
+        r1p_buf.resize(r1p_len);
+        pi_buf.resize(pi_len);
+
+        // CHET baseline: compute mu inside TEE (no server-side CHET)
+        {
+            std::vector<uint8_t> r1p2_buf(512);
+            std::vector<uint8_t> pi2_buf(512);
+            uint32_t r1p2_len = 0;
+            uint32_t pi2_len = 0;
+
+            const uint64_t ts_tee2 = now_us();
+            ecall_ret = -1;
+            st = ecall_hrpch_insider_adapt_all_tee(
+                eid,
+                &ecall_ret,
+                st0.t,
+                const_cast<uint8_t*>(st0.root_user.data()),
+                const_cast<uint8_t*>(st0.root_owner.data()),
+                const_cast<uint8_t*>(st0.sig_der.data()),
+                st0.sig_der.size(),
+                user_id.c_str(),
+                user_idx_u,
+                const_cast<uint8_t*>(user_tk_bytes.data()),
+                static_cast<uint32_t>(user_tk_bytes.size()),
+                const_cast<uint8_t*>(user_proof_ptr),
+                static_cast<uint32_t>(user_proof_bytes.size()),
+                owner_id.c_str(),
+                owner_idx_u,
+                const_cast<uint8_t*>(owner_enc_sk.data()),
+                static_cast<uint32_t>(owner_enc_sk.size()),
+                const_cast<uint8_t*>(owner_proof_ptr),
+                static_cast<uint32_t>(owner_proof_bytes.size()),
+                const_cast<uint8_t*>(n1_bytes.data()),
+                n1_bytes.size(),
+                const_cast<uint8_t*>(e1_bytes.data()),
+                e1_bytes.size(),
+                const_cast<uint8_t*>(n2_bytes.data()),
+                n2_bytes.size(),
+                const_cast<uint8_t*>(m_bytes.data()),
+                m_bytes.size(),
+                const_cast<uint8_t*>(mp_bytes.data()),
+                mp_bytes.size(),
+                const_cast<uint8_t*>(h1_bytes.data()),
+                h1_bytes.size(),
+                const_cast<uint8_t*>(r1_bytes.data()),
+                r1_bytes.size(),
+                const_cast<uint8_t*>(r2_bytes.data()),
+                r2_bytes.size(),
+                const_cast<uint8_t*>(a1_bytes.data()),
+                a1_bytes.size(),
+                const_cast<uint8_t*>(a2_bytes.data()),
+                a2_bytes.size(),
+                const_cast<uint8_t*>(tx.ibe_ct.data()),
+                tx.ibe_ct.size(),
+                r1p2_buf.data(),
+                r1p2_buf.size(),
+                &r1p2_len,
+                pi2_buf.data(),
+                pi2_buf.size(),
+                &pi2_len);
+            const uint64_t te_tee2 = now_us();
+            t_ms["InsiderAdaptAllCHET(TEE)"] = (te_tee2 - ts_tee2) / 1000.0;
+            if (st != SGX_SUCCESS || ecall_ret != 0) {
+                std::printf("ecall_hrpch_insider_adapt_all_tee failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+            }
+        }
+
+        mpz_t r1_p, pi_mpz;
+        mpz_inits(r1_p, pi_mpz, nullptr);
+        mpz_from_bytes(r1_p, r1p_buf.data(), r1p_buf.size());
+        mpz_from_bytes(pi_mpz, pi_buf.data(), pi_buf.size());
+
+        // ---------- UserAdapt ----------
+        const uint64_t ts_user = now_us();
+        element_t K_rec;
+        element_init_same_as(K_rec, GT);
+        const uint64_t ts_abe_dec = now_us();
+        fame.Decrypt(&mpk_abe, &tc, &dk, &K_rec);
+        const uint64_t te_abe_dec = now_us();
+        t_ms["UserAdapt.ABEDecrypt"] = (te_abe_dec - ts_abe_dec) / 1000.0;
+
+        mpz_t d_dec_rec, r2_p;
+        mpz_inits(d_dec_rec, r2_p, nullptr);
+        const uint64_t ts_aes_dec = now_us();
+        aes.Dec(&K_rec, &tx.ct_usr, &d_dec_rec);
+        const uint64_t te_aes_dec = now_us();
+        t_ms["UserAdapt.AESDec"] = (te_aes_dec - ts_aes_dec) / 1000.0;
+
+        const uint64_t ts_rsa = now_us();
+        mpz_powm(r2_p, pi_mpz, d_dec_rec, n2);
+        const uint64_t te_rsa = now_us();
+        t_ms["UserAdapt.RSAExp"] = (te_rsa - ts_rsa) / 1000.0;
+        const uint64_t ts_user_verify = now_us();
+        ok_new = tpch_check(n1, e1, n2, m_p, tx.h1, tx.h2, r1_p, r2_p);
+        const uint64_t te_user_verify = now_us();
+        t_ms["UserAdapt.Verify"] = (te_user_verify - ts_user_verify) / 1000.0;
+        const uint64_t te_user = now_us();
+        t_ms["UserAdapt"] = (te_user - ts_user) / 1000.0;
+
+        // ---------- Baseline Adapt (standard ABE, no outsourcing) ----------
+        {
+            CP_ABE cpabe(&G1, &G2, &GT, &Zp);
+            CP_ABE::msk msk_base;
+            CP_ABE::mpk mpk_base;
+            msk_base.Init(&G1, &G2, &Zp);
+            mpk_base.Init(&G2, &GT);
+            cpabe.Setup(&msk_base, &mpk_base);
+
+            CP_ABE::sks sks_base;
+            sks_base.Init(&G1, &G2, static_cast<int>(attrs.size()));
+            cpabe.KeyGen(&msk_base, &mpk_base, const_cast<std::vector<std::string>*>(&attrs), &sks_base);
+
+            CP_ABE::ciphertext ct_base;
+            ct_base.Init(&G1, &G2, &GT, policy_attrs);
+            element_t K_base;
+            element_init_same_as(K_base, GT);
+            element_random(K_base);
+            cpabe.Encrypt(&mpk_base, &K_base, policy, &ct_base);
+            AES aes_base;
+            mpz_t ct_b2;
+            mpz_init(ct_b2);
+            aes_base.Enc(&K_base, &d_dec, &ct_b2);
+
+            const std::vector<uint8_t> ibe_ct_base = ibe_encrypt_mpz(pairing, g_kgc.ibe, do_id_bytes, k);
+
+            mpz_t r1_p_base, pi_base;
+            mpz_t b2_base, r2_p_base;
+            mpz_inits(r1_p_base, pi_base, b2_base, r2_p_base, nullptr);
+
+            std::vector<uint8_t> r1p_base_buf(512);
+            std::vector<uint8_t> pi_base_buf(512);
+            uint32_t r1p_base_len = 0;
+            uint32_t pi_base_len = 0;
+
+            const uint64_t ts_owner = now_us();
+            ecall_ret = -1;
+            st = ecall_hrpch_insider_adapt_no_outsource(
+                eid,
+                &ecall_ret,
+                owner_id.c_str(),
+                const_cast<uint8_t*>(owner_enc_sk.data()),
+                static_cast<uint32_t>(owner_enc_sk.size()),
+                const_cast<uint8_t*>(n1_bytes.data()),
+                n1_bytes.size(),
+                const_cast<uint8_t*>(e1_bytes.data()),
+                e1_bytes.size(),
+                const_cast<uint8_t*>(n2_bytes.data()),
+                n2_bytes.size(),
+                const_cast<uint8_t*>(m_bytes.data()),
+                m_bytes.size(),
+                const_cast<uint8_t*>(mp_bytes.data()),
+                mp_bytes.size(),
+                const_cast<uint8_t*>(h1_bytes.data()),
+                h1_bytes.size(),
+                const_cast<uint8_t*>(r1_bytes.data()),
+                r1_bytes.size(),
+                const_cast<uint8_t*>(r2_bytes.data()),
+                r2_bytes.size(),
+                const_cast<uint8_t*>(a1_bytes.data()),
+                a1_bytes.size(),
+                const_cast<uint8_t*>(a2_bytes.data()),
+                a2_bytes.size(),
+                const_cast<uint8_t*>(ibe_ct_base.data()),
+                static_cast<uint32_t>(ibe_ct_base.size()),
+                r1p_base_buf.data(),
+                r1p_base_buf.size(),
+                &r1p_base_len,
+                pi_base_buf.data(),
+                pi_base_buf.size(),
+                &pi_base_len);
+            const uint64_t te_owner = now_us();
+            t_ms["Baseline.OwnerAdapt"] = (te_owner - ts_owner) / 1000.0;
+
+            if (st != SGX_SUCCESS || ecall_ret != 0) {
+                std::printf("ecall_hrpch_insider_adapt_no_outsource failed: sgx=0x%x ret=%d\n", st, ecall_ret);
+                sgx_destroy_enclave(eid);
+                return 6;
+            }
+
+            r1p_base_buf.resize(r1p_base_len);
+            pi_base_buf.resize(pi_base_len);
+            if (r1p_base_buf.empty() || pi_base_buf.empty()) {
+                std::printf("Baseline adapt output empty\n");
+                sgx_destroy_enclave(eid);
+                return 7;
+            }
+
+            mpz_from_bytes(r1_p_base, r1p_base_buf.data(), r1p_base_buf.size());
+            mpz_from_bytes(pi_base, pi_base_buf.data(), pi_base_buf.size());
+
+            const uint64_t ts_user_base = now_us();
+            bool ok_b2 = false;
+            element_t K_rec;
+            element_init_same_as(K_rec, GT);
+            try {
+                cpabe.Decrypt(&mpk_base, &ct_base, &sks_base, &K_rec);
+                aes_base.Dec(&K_rec, &ct_b2, &b2_base);
+                ok_b2 = true;
+            } catch (...) {
+                ok_b2 = false;
+            }
+            if (ok_b2) {
+                mpz_powm(r2_p_base, pi_base, b2_base, n2);
+            }
+            const uint64_t ts_user_verify = now_us();
+            const bool ok_base = ok_b2 && tpch_check(n1, e1, n2, m_p, tx.h1, tx.h2, r1_p_base, r2_p_base);
+            const uint64_t te_user_verify = now_us();
+            t_ms["Baseline.UserVerify"] = (te_user_verify - ts_user_verify) / 1000.0;
+            if (!ok_base) {
+                std::printf("Baseline adapt verify failed\n");
+            }
+            const uint64_t te_user_base = now_us();
+            t_ms["Baseline.UserAdapt"] = (te_user_base - ts_user_base) / 1000.0;
+
+            element_clear(K_rec);
+            element_clear(K_base);
+            mpz_clears(ct_b2, r1_p_base, pi_base, b2_base, r2_p_base, nullptr);
+        }
+
+        // Verify new collision
+        std::printf("HR-PCH pipeline verify: %s\n", ok_new ? "success" : "failed");
+
+        // ---------- Revocation demo ----------
+        State st1;
+        st1.t = 1;
+        std::vector<Hash32> revoked_leaves = user_leaves;
+        revoked_leaves[target_idx] = hash_user_leaf(user_id, random_bytes_vec(user_tk_bytes.size()));
+        const MerkleTree revoked_tree = build_merkle_tree(revoked_leaves);
+        st1.root_user = revoked_tree.root();
+        st1.root_owner = st0.root_owner;
+        st1.sig_der = sig_sign(sig_kp.sk, st1.t, st1.root_user, st1.root_owner);
+        const std::vector<Hash32> revoked_proof = revoked_tree.proof(static_cast<uint32_t>(target_idx));
+        const std::vector<uint8_t> revoked_proof_bytes = proof_to_bytes(revoked_proof);
+        const uint8_t* revoked_proof_ptr = revoked_proof_bytes.empty() ? nullptr : revoked_proof_bytes.data();
+
+        ecall_ret = -1;
+        uint32_t dummy_len1 = 0;
+        uint32_t dummy_len2 = 0;
+        st = ecall_hrpch_insider_adapt(
+            eid,
+            &ecall_ret,
+            st1.t,
+            const_cast<uint8_t*>(st1.root_user.data()),
+            const_cast<uint8_t*>(st1.root_owner.data()),
+            const_cast<uint8_t*>(st1.sig_der.data()),
+            st1.sig_der.size(),
+            user_id.c_str(),
+            user_idx_u,
+            const_cast<uint8_t*>(user_tk_bytes.data()),
+            static_cast<uint32_t>(user_tk_bytes.size()),
+            const_cast<uint8_t*>(revoked_proof_ptr),
+            static_cast<uint32_t>(revoked_proof_bytes.size()),
+            owner_id.c_str(),
+            owner_idx_u,
+            const_cast<uint8_t*>(owner_enc_sk.data()),
+            static_cast<uint32_t>(owner_enc_sk.size()),
+            const_cast<uint8_t*>(owner_proof_ptr),
+            static_cast<uint32_t>(owner_proof_bytes.size()),
+            const_cast<uint8_t*>(n1_bytes.data()),
+            n1_bytes.size(),
+            const_cast<uint8_t*>(e1_bytes.data()),
+            e1_bytes.size(),
+            const_cast<uint8_t*>(n2_bytes.data()),
+            n2_bytes.size(),
+            const_cast<uint8_t*>(m_bytes.data()),
+            m_bytes.size(),
+            const_cast<uint8_t*>(mp_bytes.data()),
+            mp_bytes.size(),
+            const_cast<uint8_t*>(h1_bytes.data()),
+            h1_bytes.size(),
+            const_cast<uint8_t*>(mu1_bytes.data()),
+            mu1_bytes.size(),
+            const_cast<uint8_t*>(mu21_bytes.data()),
+            mu21_bytes.size(),
+            const_cast<uint8_t*>(mu22_bytes.data()),
+            mu22_bytes.size(),
+            const_cast<uint8_t*>(tx.ibe_ct.data()),
+            tx.ibe_ct.size(),
+            r1p_buf.data(),
+            r1p_buf.size(),
+            &dummy_len1,
+            pi_buf.data(),
+            pi_buf.size(),
+            &dummy_len2);
+        t_ms["TEE(Revoked)"] = 0;
+        if (st == SGX_SUCCESS && ecall_ret != 0) {
+            t_ms["TEE(Revoked)"] = 1; // marker
+        }
+
+        // ---------- write results.json ----------
+        const bool revoked_ok = (t_ms["TEE(Revoked)"] > 0.5);
+        std::ostringstream js;
+        js << "{\n";
+        js << "  \"params\": {\n";
+        js << "    \"curve\": \"" << json_escape(curve) << "\",\n";
+        js << "    \"rsa_bits\": " << rsa_bits << ",\n";
+        js << "    \"attrs\": " << attrs.size() << ",\n";
+        js << "    \"user_count\": " << user_count << ",\n";
+        js << "    \"policy\": \"" << json_escape(policy) << "\",\n";
+        js << "    \"user_id\": \"" << json_escape(user_id) << "\",\n";
+        js << "    \"do_id\": \"" << json_escape(do_id) << "\",\n";
+        js << "    \"dlo_version\": \"" << kDloVersion << "\",\n";
+        js << "    \"oabe\": \"FAME-OD\",\n";
+        js << "    \"oabe_impl\": \"v2\",\n";
+        js << "    \"revocation_enforced\": " << (revoked_ok ? "true" : "false") << "\n";
+        js << "  },\n";
+        js << "  \"times_ms\": {\n";
+        {
+            bool first = true;
+            for (const auto& kv : t_ms) {
+                if (!first) js << ",\n";
+                first = false;
+                js << "    \"" << json_escape(kv.first) << "\": " << kv.second;
+            }
+            js << "\n";
+        }
+        js << "  },\n";
+        js << "  \"sizes_bytes\": {\n";
+        {
+            bool first = true;
+            for (const auto& kv : s_bytes) {
+                if (!first) js << ",\n";
+                first = false;
+                js << "    \"" << json_escape(kv.first) << "\": " << kv.second;
+            }
+            js << "\n";
+        }
+        js << "  }\n";
+        js << "}\n";
+
+        {
+            std::ofstream out(out_path, std::ios::binary);
+            out << js.str();
+        }
+
+        // charts
+        {
+            std::vector<std::pair<std::string, double>> items;
+            for (const auto& kv : t_ms) {
+                if (kv.first == "TEE(Revoked)") continue;
+                items.push_back(kv);
+            }
+            write_svg_bar("artifacts/runtime.svg", "HR-PCH Runtime (ms)", items, "ms");
+        }
+        {
+            std::vector<std::pair<std::string, double>> items;
+            for (const auto& kv : s_bytes) {
+                items.push_back({kv.first, static_cast<double>(kv.second)});
+            }
+            write_svg_bar("artifacts/storage.svg", "HR-PCH Storage (bytes)", items, "bytes");
+        }
+
+        // report
+        {
+            std::ofstream rep("artifacts/REPORT.md", std::ios::binary);
+            rep << "# HR-PCH 实验报告\n\n";
+            rep << "## 实验分析（图）\n\n";
+            rep << "- 效率图：`runtime.svg`\n";
+            rep << "- 存储图：`storage.svg`\n\n";
+
+            rep << "## 实验数据（表）\n\n";
+            rep << "### 时间（ms）\n\n";
+            rep << "| 算子 | 时间(ms) |\n";
+            rep << "|---|---:|\n";
+            for (const auto& kv : t_ms) {
+                if (kv.first == "TEE(Revoked)") continue;
+                rep << "| " << kv.first << " | " << kv.second << " |\n";
+            }
+            rep << "\n### 存储（bytes）\n\n";
+            rep << "| 字段 | bytes |\n";
+            rep << "|---|---:|\n";
+            for (const auto& kv : s_bytes) {
+                rep << "| " << kv.first << " | " << kv.second << " |\n";
+            }
+
+            rep << "\n## 理论分析（表）\n\n";
+            rep << "| 算法 | 主要代价（理论） | 说明 |\n";
+            rep << "|---|---|---|\n";
+            rep << "| Setup(KGC) | 1×RSAKGen + 1×OABE.Setup + 1×IBE.Setup + 1×SIG.KeyGen | KGC 初始化 |\n";
+            rep << "| KeyGen(User) | 1×OABE.KeyGen + 1×IBE.Extract | KGC 生成 (TK,DK) 并提取 sk_L |\n";
+            rep << "| Hash(DO) | 2×RSA exp + 1×OABE.Enc + 1×IBE.Enc + 1×AES-Enc | 生成 h,r,ξ |\n";
+            rep << "| Verify | 2×RSA exp | 校验哈希一致性 |\n";
+            rep << "| ServerAdapt | 3×RSA exp + 1×OABE.Transform | Server 外包计算 (μ,τ) |\n";
+            rep << "| InsiderAdapt(TEE) | 3×RSA exp + 1×IBE.Dec + 1×SIG.Verify | Enclave 内执行并返回 (r1',π) |\n";
+            rep << "| UserAdapt | 1×OABE.Dec + 1×AES-Dec + 1×RSA exp | 用户恢复 r2' 并完成碰撞 |\n\n";
+
+            std::string out_ref = out_path;
+            if (out_ref.rfind("artifacts/", 0) == 0) {
+                out_ref = out_ref.substr(std::strlen("artifacts/"));
+            }
+            rep << "原始数据：`" << out_ref << "`\n";
+        }
+
+        sgx_destroy_enclave(eid);
+
+        // cleanup OpenSSL keys
+        EVP_PKEY_free(sig_kp.sk);
+        EVP_PKEY_free(sig_kp.vk);
+        ibe_clear(g_kgc.ibe);
+
+        // mpz cleanup
+        mpz_clears(n1, e1, d1, phi1, nullptr);
+        mpz_clears(n2, d2, phi2, nullptr);
+        mpz_clears(r1, r2, nullptr);
+        mpz_clears(k, a1, a2, b1, b2, inv_k, inv_a1, inv_a2, d_dec, nullptr);
+        mpz_clears(m_p, nullptr);
+        mpz_clears(h1_mp, inv_h1_mp, mu1, nullptr);
+        mpz_clears(x2_mp, x2_p, y2, inv_x2_p, X, mu2_1, mu2_2, nullptr);
+        mpz_clears(r1_p, pi_mpz, nullptr);
+        mpz_clears(d_dec_rec, r2_p, nullptr);
+
+        element_clear(K_rec);
+
+        exit_code = ok_new ? 0 : 6;
+    }
+
+    element_clear(G1);
+    element_clear(G2);
+    element_clear(GT);
+    element_clear(Zp);
+    pairing_clear(pairing);
+    pbc_param_clear(par);
+
+    return exit_code;
+}

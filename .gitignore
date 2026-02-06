@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+**/build/
+**/*.o
+**/*.a
+**/*.so
+**/*.bin
+**/artifacts/
+.config_*
+
+# Local scratch / temporary files
+tmp_*
+test_*.json
+
+# Paper / figures / raw reports (do not publish)
+Ours_scheme/
+figure/
+report/
+DLO-PCH-BASE.md
+DLO-PCH.md
+DLO-PCH.png
+GENERATED_FIGURES.md
+HRPCH.md
+IEEEtran.cls
+article.md
+article.pdf
+experiment.md
+reference.bib
+rpch-tifs-final-revised.tex
+
+# SGX signing keys (generated during build)
+**/*.pem
+
+# Optional local SGX dependency bundle (do not commit compiled libs)
+sgx_deps/include/
+sgx_deps/lib/
+
+# TeX intermediates
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+
+cryptodef.sty
+
+generate_paper_assets.py

@@ -1,0 +1,14 @@
+<!-- Please refer to Intel SGX SDK User's Guide for the explanation of each field -->
+<EnclaveConfiguration>
+  <ProdID>0</ProdID>
+  <ISVSVN>0</ISVSVN>
+  <StackMaxSize>0x40000</StackMaxSize>
+  <!-- State-check passes a signed user list; for N up to 2^18 this is ~2MB. -->
+  <!-- Increase enclave heap to avoid marshalling OOM and ensure real enclave verification runs. -->
+  <HeapMaxSize>0x800000</HeapMaxSize>
+  <TCSNum>6</TCSNum>
+  <TCSPolicy>1</TCSPolicy>
+  <DisableDebug>0</DisableDebug>
+  <MiscSelect>0</MiscSelect>
+  <MiscMask>0xFFFFFFFF</MiscMask>
+</EnclaveConfiguration>

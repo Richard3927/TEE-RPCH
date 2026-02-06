@@ -1,0 +1,388 @@
+--- App.cpp.orig	2026-01-29 00:00:00.000000000 +0000
++++ App.cpp	2026-01-29 00:00:00.000000000 +0000
+@@ -1749,235 +1749,192 @@
+         const uint64_t ts = now_us();
+ 
+         if (bench_mode == "hrpch") {
+-            // Stage A (server): CHET + OABE transform, parallelized by server threads.
+-            // Stage B (TEE): enclave insider-adapt (IBE decrypt + checks).
+-            // Stage C (user): final OABE decrypt + RSA exp + verify.
+-            //
+-            // IMPORTANT: TEE-holder and user are different principals; for batched independent requests they can be
+-            // pipelined across tasks. We therefore model HR-PCH as a 3-stage pipeline (server -> TEE -> user).
+-            std::mutex free_mu;
+-            std::condition_variable free_cv;
+-            std::vector<size_t> free_ctx;
+-            free_ctx.reserve(ctxs.size());
+-            for (size_t i = 0; i < ctxs.size(); i++) {
+-                free_ctx.push_back(i);
+-            }
+-
+-            std::mutex q_mu;
+-            std::condition_variable q_cv;
+-            std::deque<CostJob> q;
+-
+-            struct UserJob {
+-                size_t ctx_idx = 0;
+-                bool ok = true;
+-                std::vector<uint8_t> r1p;
+-                std::vector<uint8_t> pi;
+-            };
+-            std::mutex q2_mu;
+-            std::condition_variable q2_cv;
+-            std::deque<UserJob> q2;
+-
++            // ========================================================================
++            // TRUE PARALLEL THREADING - NO PIPELINE
++            // Each worker thread completes full Server → TEE → User flow for each task
++            // ========================================================================
+             std::atomic<size_t> next_task{0};
+ 
+-            auto server_worker = [&]() {
++            // Worker function: each thread does complete Server→TEE→User flow
++            auto parallel_worker = [&]() {
++                AES aes;  // Local AES instance for user stage
++
+                 for (;;) {
++                    // Get next task atomically
+                     const size_t idx_task = next_task.fetch_add(1);
+                     if (idx_task >= static_cast<size_t>(bench_tasks)) {
+                         break;
+                     }
+ 
+-                    size_t ctx_idx = 0;
+-                    {
+-                        std::unique_lock<std::mutex> lock(free_mu);
+-                        free_cv.wait(lock, [&]() { return !free_ctx.empty(); });
+-                        ctx_idx = free_ctx.back();
+-                        free_ctx.pop_back();
+-                    }
+-
++                    // Use per-thread context to avoid contention
++                    const size_t ctx_idx = idx_task % ctxs.size();
+                     auto& ctx = ctxs[ctx_idx];
+ 
+-                    // --- Server-side CHET: compute μ ---
+-                    Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n1, ctx.h1_mp);
+-                    mpz_invert(ctx.inv_h1_mp, ctx.h1_mp, ctx.n1);
+-                    mpz_mul(ctx.mu1, ctx.h1, ctx.inv_h1_mp);
+-                    mpz_mod(ctx.mu1, ctx.mu1, ctx.n1);
+-
+-                    Hgsm_n_2(ctx.m, ctx.n1, ctx.n2, ctx.n2, ctx.x2_mp);
+-                    Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n2, ctx.x2_p);
+-                    mpz_powm(ctx.y2, ctx.r2, ctx.e1, ctx.n2);
+-                    mpz_mul(ctx.y2, ctx.x2_mp, ctx.y2);
+-                    mpz_mod(ctx.y2, ctx.y2, ctx.n2);
+-                    mpz_invert(ctx.inv_x2_p, ctx.x2_p, ctx.n2);
+-                    mpz_mul(ctx.X, ctx.y2, ctx.inv_x2_p);
+-                    mpz_mod(ctx.X, ctx.X, ctx.n2);
+-                    mpz_powm(ctx.mu2_1, ctx.X, ctx.a1, ctx.n2);
+-                    mpz_powm(ctx.mu2_2, ctx.X, ctx.a2, ctx.n2);
+-
+-                    CostJob job;
+-                    job.ctx_idx = ctx_idx;
+-                    try {
+-                        job.mu1 = mpz_to_bytes(ctx.mu1);
+-                        job.mu21 = mpz_to_bytes(ctx.mu2_1);
+-                        job.mu22 = mpz_to_bytes(ctx.mu2_2);
+-
+-                        // --- Server-side OABE transform -> τ ---
+-                        ctx.fame->Transform(&mpk_abe, &ctx.ct, &ctx.tk, &ctx.tc);
+-                    } catch (...) {
+-                        // Keep pipeline progress; let the user stage count this task as failed.
+-                        job.ok = false;
+-                    }
++                    bool task_ok = true;
+ 
+-                    {
+-                        std::lock_guard<std::mutex> lock(q_mu);
+-                        q.emplace_back(std::move(job));
+-                    }
+-                    q_cv.notify_one();
+-                }
+-            };
++                    // ================================================================
++                    // STAGE 1: Server-side CHET + OABE transform
++                    // ================================================================
++                    try {
++                        // Server-side CHET: compute μ
++                        Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n1, ctx.h1_mp);
++                        mpz_invert(ctx.inv_h1_mp, ctx.h1_mp, ctx.n1);
++                        mpz_mul(ctx.mu1, ctx.h1, ctx.inv_h1_mp);
++                        mpz_mod(ctx.mu1, ctx.mu1, ctx.n1);
++
++                        Hgsm_n_2(ctx.m, ctx.n1, ctx.n2, ctx.n2, ctx.x2_mp);
++                        Hgsm_n_2(ctx.m_p, ctx.n1, ctx.n2, ctx.n2, ctx.x2_p);
++                        mpz_powm(ctx.y2, ctx.r2, ctx.e1, ctx.n2);
++                        mpz_mul(ctx.y2, ctx.x2_mp, ctx.y2);
++                        mpz_mod(ctx.y2, ctx.y2, ctx.n2);
++                        mpz_invert(ctx.inv_x2_p, ctx.x2_p, ctx.n2);
++                        mpz_mul(ctx.X, ctx.y2, ctx.inv_x2_p);
++                        mpz_mod(ctx.X, ctx.X, ctx.n2);
++                        mpz_powm(ctx.mu2_1, ctx.X, ctx.a1, ctx.n2);
++                        mpz_powm(ctx.mu2_2, ctx.X, ctx.a2, ctx.n2);
++
++                        // Server-side OABE transform
++                        ctx.fame->Transform(&mpk_abe, &ctx.ct, &ctx.tk, &ctx.tc);
++                    } catch (...) {
++                        task_ok = false;
++                    }
+ 
+-            auto tee_worker = [&]() {
+-                for (size_t done = 0; done < static_cast<size_t>(bench_tasks); done++) {
+-                    CostJob job;
+-                    {
+-                        std::unique_lock<std::mutex> lock(q_mu);
+-                        q_cv.wait(lock, [&]() { return !q.empty(); });
+-                        job = std::move(q.front());
+-                        q.pop_front();
++                    std::vector<uint8_t> mu1_bytes;
++                    std::vector<uint8_t> mu21_bytes;
++                    std::vector<uint8_t> mu22_bytes;
++
++                    if (task_ok) {
++                        try {
++                            mu1_bytes = mpz_to_bytes(ctx.mu1);
++                            mu21_bytes = mpz_to_bytes(ctx.mu2_1);
++                            mu22_bytes = mpz_to_bytes(ctx.mu2_2);
++                        } catch (...) {
++                            task_ok = false;
++                        }
+                     }
+ 
+-                    UserJob out;
+-                    out.ctx_idx = job.ctx_idx;
+-                    out.ok = job.ok;
+-
+-                    if (job.ok) {
+-                        std::vector<uint8_t> r1p_buf(512);
+-                        std::vector<uint8_t> pi_buf(512);
+-                        uint32_t r1p_len = 0;
+-                        uint32_t pi_len = 0;
+-                        int local_ret = -1;
+-
+-                        const sgx_status_t rc = ecall_hrpch_insider_adapt(
+-                            eid,
+-                            &local_ret,
+-                            st0.t,
+-                            const_cast<uint8_t*>(st0.root_user.data()),
+-                            const_cast<uint8_t*>(st0.root_owner.data()),
+-                            const_cast<uint8_t*>(st0.sig_der.data()),
+-                            st0.sig_der.size(),
+-                            user_id.c_str(),
+-                            user_idx_u,
+-                            const_cast<uint8_t*>(user_tk_bytes.data()),
+-                            static_cast<uint32_t>(user_tk_bytes.size()),
+-                            const_cast<uint8_t*>(user_proof_ptr),
+-                            static_cast<uint32_t>(user_proof_bytes.size()),
+-                            owner_id.c_str(),
+-                            owner_idx_u,
+-                            const_cast<uint8_t*>(owner_enc_sk.data()),
+-                            static_cast<uint32_t>(owner_enc_sk.size()),
+-                            const_cast<uint8_t*>(owner_proof_ptr),
+-                            static_cast<uint32_t>(owner_proof_bytes.size()),
+-                            const_cast<uint8_t*>(n1_bytes.data()),
+-                            n1_bytes.size(),
+-                            const_cast<uint8_t*>(e1_bytes.data()),
+-                            e1_bytes.size(),
+-                            const_cast<uint8_t*>(n2_bytes.data()),
+-                            n2_bytes.size(),
+-                            const_cast<uint8_t*>(m_bytes.data()),
+-                            m_bytes.size(),
+-                            const_cast<uint8_t*>(mp_bytes.data()),
+-                            mp_bytes.size(),
+-                            const_cast<uint8_t*>(h1_bytes.data()),
+-                            h1_bytes.size(),
+-                            const_cast<uint8_t*>(job.mu1.data()),
+-                            static_cast<uint32_t>(job.mu1.size()),
+-                            const_cast<uint8_t*>(job.mu21.data()),
+-                            static_cast<uint32_t>(job.mu21.size()),
+-                            const_cast<uint8_t*>(job.mu22.data()),
+-                            static_cast<uint32_t>(job.mu22.size()),
+-                            const_cast<uint8_t*>(ibe_ct.data()),
+-                            static_cast<uint32_t>(ibe_ct.size()),
+-                            r1p_buf.data(),
+-                            static_cast<uint32_t>(r1p_buf.size()),
+-                            &r1p_len,
+-                            pi_buf.data(),
+-                            static_cast<uint32_t>(pi_buf.size()),
+-                            &pi_len);
+-
+-                        if (rc != SGX_SUCCESS || local_ret != 0) {
+-                            out.ok = false;
+-                        } else {
+-                            r1p_buf.resize(r1p_len);
+-                            pi_buf.resize(pi_len);
+-                            if (r1p_buf.empty() || pi_buf.empty()) {
+-                                out.ok = false;
+-                            } else {
+-                                out.r1p = std::move(r1p_buf);
+-                                out.pi = std::move(pi_buf);
+-                            }
++                    // ================================================================
++                    // STAGE 2: TEE insider-adapt (SERIALIZED with mutex for SGX safety)
++                    // ================================================================
++                    std::vector<uint8_t> r1p_buf(512);
++                    std::vector<uint8_t> pi_buf(512);
++                    uint32_t r1p_len = 0;
++                    uint32_t pi_len = 0;
++
++                    if (task_ok) {
++                        // CRITICAL: SGX enclave calls MUST be serialized
++                        // Static mutex serializes all TEE calls across threads
++                        static std::mutex tee_mutex;
++                        std::lock_guard<std::mutex> tee_lock(tee_mutex);
++
++                        int local_ret = -1;
++                        const sgx_status_t rc = ecall_hrpch_insider_adapt(
++                            eid,
++                            &local_ret,
++                            st0.t,
++                            const_cast<uint8_t*>(st0.root_user.data()),
++                            const_cast<uint8_t*>(st0.root_owner.data()),
++                            const_cast<uint8_t*>(st0.sig_der.data()),
++                            st0.sig_der.size(),
++                            user_id.c_str(),
++                            user_idx_u,
++                            const_cast<uint8_t*>(user_tk_bytes.data()),
++                            static_cast<uint32_t>(user_tk_bytes.size()),
++                            const_cast<uint8_t*>(user_proof_ptr),
++                            static_cast<uint32_t>(user_proof_bytes.size()),
++                            owner_id.c_str(),
++                            owner_idx_u,
++                            const_cast<uint8_t*>(owner_enc_sk.data()),
++                            static_cast<uint32_t>(owner_enc_sk.size()),
++                            const_cast<uint8_t*>(owner_proof_ptr),
++                            static_cast<uint32_t>(owner_proof_bytes.size()),
++                            const_cast<uint8_t*>(n1_bytes.data()),
++                            n1_bytes.size(),
++                            const_cast<uint8_t*>(e1_bytes.data()),
++                            e1_bytes.size(),
++                            const_cast<uint8_t*>(n2_bytes.data()),
++                            n2_bytes.size(),
++                            const_cast<uint8_t*>(m_bytes.data()),
++                            m_bytes.size(),
++                            const_cast<uint8_t*>(mp_bytes.data()),
++                            mp_bytes.size(),
++                            const_cast<uint8_t*>(h1_bytes.data()),
++                            h1_bytes.size(),
++                            const_cast<uint8_t*>(mu1_bytes.data()),
++                            static_cast<uint32_t>(mu1_bytes.size()),
++                            const_cast<uint8_t*>(mu21_bytes.data()),
++                            static_cast<uint32_t>(mu21_bytes.size()),
++                            const_cast<uint8_t*>(mu22_bytes.data()),
++                            static_cast<uint32_t>(mu22_bytes.size()),
++                            const_cast<uint8_t*>(ibe_ct.data()),
++                            static_cast<uint32_t>(ibe_ct.size()),
++                            r1p_buf.data(),
++                            static_cast<uint32_t>(r1p_buf.size()),
++                            &r1p_len,
++                            pi_buf.data(),
++                            static_cast<uint32_t>(pi_buf.size()),
++                            &pi_len);
++
++                        if (rc != SGX_SUCCESS || local_ret != 0) {
++                            task_ok = false;
++                        } else {
++                            r1p_buf.resize(r1p_len);
++                            pi_buf.resize(pi_len);
++                            if (r1p_buf.empty() || pi_buf.empty()) {
++                                task_ok = false;
++                            }
+                         }
+                     }
+ 
+-                    {
+-                        std::lock_guard<std::mutex> lock(q2_mu);
+-                        q2.emplace_back(std::move(out));
++                    // ================================================================
++                    // STAGE 3: User-side final decryption and verification
++                    // ================================================================
++                    if (task_ok) {
++                        try {
++                            mpz_from_bytes(ctx.r1_p, r1p_buf.data(), r1p_buf.size());
++                            mpz_from_bytes(ctx.pi_mpz, pi_buf.data(), pi_buf.size());
++
++                            // OABE decrypt (expensive!)
++                            ctx.fame->Decrypt(&mpk_abe, &ctx.tc, &ctx.dk, &ctx.K_rec);
++
++                            // AES decrypt
++                            aes.Dec(&ctx.K_rec, &ctx.ct_usr, &ctx.d_dec_rec);
++
++                            // Final RSA exponentiation
++                            mpz_powm(ctx.r2_p, ctx.pi_mpz, ctx.d_dec_rec, ctx.n2);
++
++                            // Verify chameleon hash
++                            task_ok = tpch_check(ctx.n1, ctx.e1, ctx.n2, ctx.m_p,
++                                                ctx.h1, ctx.h2, ctx.r1_p, ctx.r2_p);
++                        } catch (...) {
++                            task_ok = false;
++                        }
+                     }
+-                    q2_cv.notify_one();
+-                }
+-            };
+ 
+-            auto user_worker = [&]() {
+-                AES aes;
+-                for (size_t done = 0; done < static_cast<size_t>(bench_tasks); done++) {
+-                    UserJob job;
+-                    {
+-                        std::unique_lock<std::mutex> lock(q2_mu);
+-                        q2_cv.wait(lock, [&]() { return !q2.empty(); });
+-                        job = std::move(q2.front());
+-                        q2.pop_front();
+-                    }
+-
+-                    auto& ctx = ctxs[job.ctx_idx];
+-
+-                    bool ok = job.ok;
+-                    if (ok) {
+-                        try {
+-                            mpz_from_bytes(ctx.r1_p, job.r1p.data(), job.r1p.size());
+-                            mpz_from_bytes(ctx.pi_mpz, job.pi.data(), job.pi.size());
+-
+-                            ctx.fame->Decrypt(&mpk_abe, &ctx.tc, &ctx.dk, &ctx.K_rec);
+-                            aes.Dec(&ctx.K_rec, &ctx.ct_usr, &ctx.d_dec_rec);
+-                            mpz_powm(ctx.r2_p, ctx.pi_mpz, ctx.d_dec_rec, ctx.n2);
+-                            ok = tpch_check(ctx.n1, ctx.e1, ctx.n2, ctx.m_p, ctx.h1, ctx.h2, ctx.r1_p, ctx.r2_p);
+-                        } catch (...) {
+-                            ok = false;
+-                        }
+-                    }
+-                    if (!ok) {
++                    if (!task_ok) {
+                         failures.fetch_add(1);
+                     }
+-
+-                    {
+-                        std::lock_guard<std::mutex> lock(free_mu);
+-                        free_ctx.push_back(job.ctx_idx);
+-                    }
+-                    free_cv.notify_one();
+                 }
+             };
+ 
+-            std::vector<std::thread> th_server;
+-            th_server.reserve(effective_threads);
++            // Launch worker threads
++            std::vector<std::thread> workers;
++            workers.reserve(effective_threads);
+             for (size_t i = 0; i < effective_threads; i++) {
+-                th_server.emplace_back(server_worker);
++                workers.emplace_back(parallel_worker);
+             }
+ 
+-            std::thread th_tee(tee_worker);
+-            std::thread th_user(user_worker);
+-
+-	            for (auto& th : th_server) {
+-	                th.join();
+-	            }
+-	            th_tee.join();
+-                th_user.join();
++            // Wait for all threads to complete
++            for (auto& th : workers) {
++                th.join();
++            }
+ 	        } else {
