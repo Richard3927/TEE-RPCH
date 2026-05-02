@@ -15,6 +15,9 @@ __pycache__/
 # Local scratch / temporary files
 tmp_*
 test_*.json
+out/
+legacy_targeted_experiments/targeted_tables/
+core
 
 # Paper / figures / raw reports (do not publish)
 Ours_scheme/
