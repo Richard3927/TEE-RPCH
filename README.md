@@ -91,7 +91,7 @@ This experiment isolates the final user-side check. It compares:
 
 The script validates that the JSON data was produced by the expected full implementation and then generates the hash-check comparison tables and figures under `out/targeted_hashcheck_revocation/`.
 
-The legacy path `five_experiments_20260429/run_targeted_tables.py` is only a wrapper to this script.
+The compatibility path `legacy_targeted_experiments/run_targeted_tables.py` forwards to this script.
 
 ## Experiment 4: Revocation Benchmark
 

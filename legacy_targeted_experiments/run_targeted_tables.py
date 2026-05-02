@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Compatibility wrapper for the organized hash-check experiment."""
 from pathlib import Path
 import runpy
 
