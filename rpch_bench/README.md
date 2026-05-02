@@ -1,34 +1,43 @@
-# Baseline Benchmarks (RPCH-XNM'21 / RPCH-TMM'22)
+# Revocation Baseline Benchmark
 
-This directory builds a small benchmark tool that generates baseline timing data for prior work
-(XNM'21 / TMM'22), which is used by the TR-PCH plotting scripts.
+This directory contains the baseline benchmark used by the revocation experiment.
+
+Implemented benchmark targets:
+
+- `EHR_RPCH`
+- `TAR_PCH`
+- `JMC_KH_2024_Lattice_RPCH`
+
+The public experiment scripts currently use EHR-RPCH and TAR-PCH for the revocation comparison against TEE-RPCH.
 
 ## Build
 
-The Makefile expects the pairing/ABE helper library under `../CH_PBC_example-main/` (sources + headers).
-If that dependency is missing in your snapshot, rebuilding will fail until you restore it.
-
 ```bash
-cd TR-PCH/HR-PCH/rpch_bench
+cd rpch_bench
 make clean
 make -j"$(nproc)"
 ```
 
+The Makefile expects `../CH_PBC_example-main/` to contain the required pairing, ABE, RSA, and helper sources.
+
 ## Run
 
-Example (users = 2^10):
+Revocation benchmark:
 
 ```bash
-./rpch_bench --curve a --users 1024 --attrs 40 --policy-attrs 40 --out artifacts/rpch_1024.json
+./rpch_bench --curve mnt224 --users 1024 --attrs 60 --policy-attrs 20 --mode revocation --out artifacts/rpch_rev_1024.json
 ```
 
-Options:
-- `--curve`: `a|a1|e|i|f|d224` (paper uses `mnt224` and `a1` / ss1024)
-- `--users`: number of users (power of two, >= 2)
-- `--attrs`: attribute set size
-- `--policy-attrs`: number of attributes used in the access policy (<= attrs)
-- `--out`: output JSON path
+Operation benchmark:
 
-Output:
-- A JSON file containing per-operation timings. This is later aggregated by `run_curve_experiments.py`
-  and plotted via `generate_paper_assets.py`.
+```bash
+./rpch_bench --curve mnt224 --users 1024 --attrs 60 --policy-attrs 20 --mode ops --out artifacts/rpch_ops_1024.json
+```
+
+Important output fields:
+
+- `params.bench_version`: should be `rpch-baselines-v10-ehr-tar-full-revocation-split`.
+- `schemes.EHR_RPCH.times_ms`: EHR-RPCH timing breakdown.
+- `schemes.TAR_PCH.times_ms`: TAR-PCH timing breakdown.
+
+The organized experiment entry point is `../experiments/exp4_revocation_benchmark.py`.

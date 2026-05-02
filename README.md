@@ -4,22 +4,13 @@ This repository contains the public implementation of **TEE-RPCH**, an Intel SGX
 
 ## Repository Structure
 
-- `hr_pch_sgx/`: main TEE-RPCH prototype, including the host application and SGX enclave
-- `rpch_bench/`: benchmark implementation for the revocation baselines used in the comparison experiments
-- `CH_PBC_example-main/`: pairing / ABE / RSA helper library used by both `hr_pch_sgx/` and `rpch_bench/`
-- `run_curve_experiments.py`: unified driver for the main paper-style experiment runs
-- `five_experiments_20260429/run_targeted_tables.py`: targeted experiment script for the hash-check comparison and the revocation benchmark table
+- `hr_pch_sgx/`: TEE-RPCH implementation, including the host application and SGX enclave.
+- `rpch_bench/`: EHR-RPCH and TAR-PCH revocation benchmark implementation.
+- `CH_PBC_example-main/`: pairing, ABE, RSA, and helper code used by the prototype and benchmark.
+- `experiments/`: organized experiment entry points.
+- `run_curve_experiments.py`: compatibility wrapper for `experiments/run_all.py`.
 
-## Build TEE-RPCH
-
-The main implementation is in `hr_pch_sgx/`.
-
-Prerequisites:
-
-1. Intel SGX driver, PSW, and SDK
-2. SGXSSL if you build the enclave with in-enclave crypto
-3. `gmp`, `pbc`, `openssl`
-4. The helper library under `CH_PBC_example-main/`
+## Build
 
 Build the SGX prototype:
 
@@ -29,7 +20,7 @@ make clean
 make SGX_MODE=HW SGX_DEBUG=0 -j"$(nproc)"
 ```
 
-Build the revocation benchmark:
+Build the baseline benchmark:
 
 ```bash
 cd rpch_bench
@@ -37,146 +28,106 @@ make clean
 make -j"$(nproc)"
 ```
 
-## Basic TEE-RPCH Run
+## Basic Construction
 
-The basic TEE-RPCH construction is executed by `hr_pch_sgx/app`. A normal run evaluates the full workflow:
-
-- setup
-- key generation
-- hash / verify
-- server-side outsourced adaptation
-- enclave-side checking
-- user-side final adaptation
-
-Example:
+The basic construction is implemented in `hr_pch_sgx/app`. A normal run executes setup, key generation, hashing, verification, server-side adaptation, enclave-side checks, and final user adaptation.
 
 ```bash
-cd hr_pch_sgx
-./app --curve mnt224 --out artifacts/results.json
+python3 experiments/exp0_basic_construction.py --curve mnt224 --build
 ```
 
-Important implementation split in the current code:
+The generated JSON records the measured roles:
 
-- the server performs the first outsourced stage
-- the enclave performs state checking, helper-key decryption, and protected checks
-- the user performs the final adaptation step
+- KGC setup and user key generation
+- data-owner hash generation
+- server adaptation
+- enclave protected checks
+- user final adaptation
 
 ## Experiment 1: Outsource vs Non-Outsource
 
-Purpose:
-
-- compare the deployed TEE-RPCH outsourced path with the no-outsource baseline inside the same implementation framework
-
-Driver:
-
-- `run_curve_experiments.py`
-
-How it works:
-
-- it runs `hr_pch_sgx/app --bench cost`
-- it generates JSON files with mode `hrpch` and `no_outsource`
-- it varies policy size and task count to compare the outsourced design against the non-outsourced path
-
-Example:
+Script:
 
 ```bash
-python3 run_curve_experiments.py --curve mnt224 --out-dir out/mnt224 --build --force
+python3 experiments/exp1_outsource_vs_no_outsource.py --curve mnt224 --build --force
 ```
 
-Key outputs:
+This compares two modes in `hr_pch_sgx/app --bench cost`:
 
-- `hrpch_u1024_a*_p*.json`: main TEE-RPCH runs
-- `hrpch_cost_hrpch_*.json`: outsourced cost measurements
-- `hrpch_cost_no_outsource_*.json`: non-outsourced cost measurements
+- `--mode hrpch`: the deployed TEE-RPCH path with server-side outsourcing.
+- `--mode no_outsource`: the non-outsourced path used as the internal baseline.
 
-## Experiment 2: Multi-Thread Experiment
+The output files are named `hrpch_cost_hrpch_*.json` and `hrpch_cost_no_outsource_*.json` so the two paths can be separated directly by filename.
 
-Purpose:
+## Experiment 2: Multi-Thread Scaling
 
-- measure how the server-side outsourced path scales with different thread counts and task counts
-
-Driver:
-
-- `run_curve_experiments.py`
-
-How it works:
-
-- cost-vs-tasks: fixed policy size, vary tasks and server thread counts
-- cost-vs-threads: fixed task count, vary policy sizes and server thread counts
-
-The relevant outputs are the `hrpch_cost_*` JSON files written by `run_curve_experiments.py`.
-
-## Experiment 3: Hash-Check Efficiency Experiment
-
-Purpose:
-
-- show the efficiency gain from replacing the old user-side full re-encryption consistency check with the current hash-check finalization
-
-Driver:
-
-- `five_experiments_20260429/run_targeted_tables.py`
-
-How it works:
-
-- it validates that the TEE-RPCH run uses the expected full implementation version
-- it compares:
-  - the full re-encryption based final user check
-  - the hash-check based final user check
-- it focuses on modifier-side finalization cost
-
-Example:
+Script:
 
 ```bash
-python3 five_experiments_20260429/run_targeted_tables.py --force
+python3 experiments/exp2_multithread_scaling.py --curve mnt224 --build --force
 ```
 
-This script is the retained targeted code path for the hash-check proof experiment.
+This experiment measures how the outsourced path behaves when server-side concurrency changes.
 
-## Experiment 4: Benchmark / Revocation Experiment
+It runs two groups:
 
-Purpose:
+- cost vs tasks: fixed policy size, varying task count and thread count
+- cost vs threads: fixed task count, varying policy size and thread count
 
-- compare **TEE-RPCH**, **EHR-RPCH**, and **TAR-PCH** on revocation-related costs
-- especially separate KGC-side and server / CSP-side work instead of reporting only coarse totals
+For the non-outsourced baseline, extra thread counts are recorded as metadata because there is no cloud/server stage to parallelize.
 
-Relevant code:
+## Experiment 3: Hash-Check Efficiency
 
-- `rpch_bench/main.cpp`
-- `rpch_bench/jmc_kh_lattice.cpp`
-- `rpch_bench/jmc_kh_lattice.h`
-- `five_experiments_20260429/run_targeted_tables.py`
-
-How it works:
-
-- `rpch_bench` runs the baseline revocation schemes
-- `run_curve_experiments.py` can generate the baseline revocation JSON files
-- `run_targeted_tables.py` checks that the benchmark version is the expected split revocation implementation and then builds the benchmark comparison table inputs
-
-Example baseline-only benchmark run:
+Script:
 
 ```bash
-cd rpch_bench
-./rpch_bench --curve mnt224 --users 1024 --attrs 60 --policy-attrs 20 --mode revocation --out artifacts/rpch_rev_1024.json
+python3 experiments/exp3_hashcheck_efficiency.py --force
 ```
 
-Example unified experiment run:
+This experiment isolates the final user-side check. It compares:
+
+- full re-encryption based consistency checking
+- hash-check based finalization
+
+The script validates that the JSON data was produced by the expected full implementation and then generates the hash-check comparison tables and figures under `out/targeted_hashcheck_revocation/`.
+
+The legacy path `five_experiments_20260429/run_targeted_tables.py` is only a wrapper to this script.
+
+## Experiment 4: Revocation Benchmark
+
+Script:
 
 ```bash
-python3 run_curve_experiments.py --curve mnt224 --out-dir out/mnt224 --force
+python3 experiments/exp4_revocation_benchmark.py --curve mnt224 --build --force
 ```
 
-## Recommended Reproduction Order
+This experiment compares revocation costs for:
 
-1. Build `hr_pch_sgx/`
-2. Build `rpch_bench/`
-3. Run `run_curve_experiments.py` for `mnt224`
-4. Run `run_curve_experiments.py` for `a1`
-5. Run `five_experiments_20260429/run_targeted_tables.py` if you want the targeted hash-check and revocation benchmark experiment
+- TEE-RPCH
+- EHR-RPCH
+- TAR-PCH
+
+TEE-RPCH state signing and TEE checking are measured by `hr_pch_sgx/app --bench state`. EHR-RPCH and TAR-PCH are measured by `rpch_bench --mode revocation`, including split KGC-side and server/CSP-side costs.
+
+## Full Organized Run
+
+Run the organized suite for one curve:
+
+```bash
+python3 experiments/run_all.py --curve mnt224 --build --force
+```
+
+The old command still works and forwards to the organized suite:
+
+```bash
+python3 run_curve_experiments.py --curve mnt224 --build --force
+```
 
 ## Notes
 
-- Measure performance in **SGX HW mode**, not SIM mode.
-- Some directory names are legacy, but the scheme implemented here is **TEE-RPCH**.
+- Performance measurements should be taken in SGX HW mode.
+- SIM mode is for functional debugging only.
+- Some source folders retain historical names, but the implemented scheme is TEE-RPCH.
 
 ## License
 
