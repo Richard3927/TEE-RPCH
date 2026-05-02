@@ -1,0 +1,82 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.82in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{hyperref}
+\title{TEE-RPCH Five-Experiment Preview (MNT224)}
+\author{Real SGX measurements from five\_experiments\_20260429/data\_mnt224}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+This preview PDF is generated only from the completed MNT224 real-SGX results under \texttt{five\_experiments\_20260429}. It is intended to let us inspect the corrected five-experiment structure before the A1 run finishes.
+
+\section{Experiment 1: Theory Comparison}
+\begin{table}[H]
+\centering
+\caption{Theory comparison.}
+\scriptsize
+\resizebox{\textwidth}{!}{\input{tables/exp1_theory.tex}}
+\end{table}
+
+\section{Experiment 2: Baseline Comparison}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{figures/adapt_comparison.pdf}
+\caption{Online adaptation cost versus policy size.}
+\end{figure}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.78\textwidth]{figures/adapt_breakdown.pdf}
+\caption{Server, enclave, and user breakdown.}
+\end{figure}
+\begin{table}[H]
+\centering
+\caption{MNT224 baseline comparison (ms).}
+\scriptsize
+\resizebox{\textwidth}{!}{\input{tables/exp2_baseline.tex}}
+\end{table}
+
+\section{Experiment 3: Hash-Check Benefit}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.86\textwidth]{figures/exp3_hashcheck.pdf}
+\caption{Legacy finalize path versus hash-check path on MNT224.}
+\end{figure}
+\begin{table}[H]
+\centering
+\caption{MNT224 user-side finalize comparison (ms).}
+\scriptsize
+\resizebox{\textwidth}{!}{\input{tables/exp3_hashcheck.tex}}
+\end{table}
+
+\section{Experiment 4: Multi-thread Evaluation}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{figures/cost_tasks_threads.pdf}
+\caption{Wall-clock cost versus task count.}
+\end{figure}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.82\textwidth]{figures/cost_threads_policy.pdf}
+\caption{Wall-clock cost versus server thread count.}
+\end{figure}
+
+\section{Experiment 5: Revocation}
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/revocation_cost.pdf}
+\caption{Revocation cost versus number of users.}
+\end{figure}
+\begin{table}[H]
+\centering
+\caption{MNT224 revocation comparison (ms).}
+\scriptsize
+\resizebox{\textwidth}{!}{\input{tables/exp5_revocation.tex}}
+\end{table}
+
+\end{document}

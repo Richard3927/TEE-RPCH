@@ -1,0 +1,13 @@
+\begin{tabular}{c c c c}
+\toprule
+scheme & keygen & hash & adapt \\
+\midrule
+FB-PCH & O(|S|) & O(|policy|) & O(|policy|) \\
+EHR-RPCH & O(|S| + log N) & O(|policy|) & O(|policy| + outsourced revoke) \\
+PNITCH & O(|S|) & O(1) & O(t) partial adapt + combine \\
+RPCH-XNM'21 & O(|S| + log N) & O(|policy|) & O(|policy| + log N) \\
+TAR-PCH & O(|S| + log N) & O(|policy|) & O(|policy| + cloud update) \\
+TPCH & O(|S|) & O(|policy|) & O(|policy| + update rounds) \\
+TEE-RPCH (ours) & O(|S|) & O(|policy|) & Server O(|policy|), TEE O(log N), User O(1) \\
+\bottomrule
+\end{tabular}

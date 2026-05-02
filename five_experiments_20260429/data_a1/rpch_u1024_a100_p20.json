@@ -1,0 +1,88 @@
+{
+  "params": {
+    "curve": "a1",
+    "bench_version": "rpch-baselines-v9-ehr-tar-revocation",
+    "rsa_bits": 3072,
+    "users": 1024,
+    "attrs": 100,
+    "policy_attrs": 20
+  },
+  "schemes": {
+    "PCH_DSS_2019": {
+      "times_ms": {
+        "Forge": 24600.7,
+        "Hash": 22772.9,
+        "KG": 14610.2,
+        "PG": 888.007
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 17057,
+        "hash_bytes": 1152,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_XNM_2021": {
+      "times_ms": {
+        "DKGen": 31.53,
+        "Forge": 24517.5,
+        "Hash": 22648,
+        "KG": 14657.2,
+        "KUpt(revoked)": 313.696,
+        "KUpt(valid)": 31.19,
+        "PG": 551.786,
+        "Rev": 0
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 17317,
+        "hash_bytes": 1152,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_TMM_2022": {
+      "times_ms": {
+        "DKGen": 0.137,
+        "Forge": 24502.6,
+        "Hash": 22719.5,
+        "KG": 14598.1,
+        "KUpt(revoked)": 315.342,
+        "KUpt(valid)": 31.423,
+        "PG": 138.754,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 16768,
+        "hash_bytes": 520,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 128,
+        "verify_ok": 1
+      }
+    },
+    "JMC_KH_2024_Lattice_RPCH": {
+      "times_ms": {
+        "Forge": 316.134,
+        "Hash": 547.927,
+        "KG": 488.141,
+        "PG": 91.431
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 171872,
+        "hash_bytes": 2496,
+        "lattice_lambda": 192,
+        "lattice_m": 7040,
+        "lattice_m0": 6144,
+        "lattice_n": 384,
+        "lattice_q_bits": 17,
+        "lattice_security_bits": 192,
+        "mpk_bytes": 16593792,
+        "msk_seed_bytes": 8241408,
+        "rand_bytes": 46704,
+        "verify_ok": 1
+      }
+    }
+  }
+}

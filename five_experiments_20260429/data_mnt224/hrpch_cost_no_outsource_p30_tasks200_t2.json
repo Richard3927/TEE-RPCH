@@ -1,0 +1,33 @@
+{
+  "params": {
+    "bench": "cost",
+    "mode": "no_outsource",
+    "dlo_version": "tee-rpch-v9-sgx-2od-split-legacy-reenc",
+    "curve": "mnt224",
+    "oabe": "FAME-2OD",
+    "oabe_impl": "abe-2od",
+    "ibe": "Boneh-Franklin-FullIdent",
+    "ibe_impl": "fullident-cca2-style",
+    "sgx_mode": "HW",
+    "adapt_split": "server-transform1-enclave-transform2-user-hashcheck",
+    "server_adapt_scope": "CHET-mu-plus-FAME-2OD-Transform1-only",
+    "tee_adapt_scope": "state-check-HK-decrypt-FAME-2OD-Transform2-IBE-etd2-check",
+    "user_adapt_scope": "FAME-2OD-final-decrypt-SE-decrypt-r2-verify-hashcheck",
+    "tee_hk_decrypt": true,
+    "tee_transform2": true,
+    "tee_etd2_check": true,
+    "user_final_hash_check": true,
+    "rsa_bits": 3072,
+    "attrs": 60,
+    "policy": "(A1|A2)&(A3|A4)&(A5|A6)&(A7|A8)&(A9|A10)&(A11|A12)&(A13|A14)&(A15|A16)&(A17|A18)&(A19|A20)&(A21|A22)&(A23|A24)&(A25|A26)&(A27|A28)&(A29|A30)",
+    "policy_attrs": 30,
+    "user_count": 1024,
+    "threads": 2,
+    "tasks": 200
+  },
+  "results": {
+    "total_ops": 200,
+    "elapsed_ms": 36707.1,
+    "failures": 0
+  }
+}

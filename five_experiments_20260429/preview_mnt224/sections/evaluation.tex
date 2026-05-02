@@ -1,0 +1,70 @@
+\section{Evaluation}
+This preview section now reflects the corrected targeted measurements generated under hardware SGX for both MNT224 and A1. The table inputs are synchronized with the targeted-table pipeline so we can inspect the paper-style layout with the updated data.
+
+\subsection{Theory Comparison}
+\begin{table*}[t]
+\centering
+\caption{Theory comparison of representative revocable policy-based chameleon hash schemes.}
+\scriptsize
+\TableStyle
+\resizebox{\textwidth}{!}{\input{../targeted_tables/tables/table1_theory.tex}}
+\end{table*}
+
+\subsection{Baseline Comparison}
+We compare the corrected split design $\textsf{CHET-2OA}+\textsf{ABE-2OD}$ with the no-cloud baseline $\textsf{CHET-OA}+\textsf{ABE-OD}$. The server, TEE, and modifier columns are reported separately to match the actual implementation split.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.84\textwidth]{../targeted_tables/figures/adaptation_latency.pdf}
+\caption{Adaptation latency split on MNT224 and A1.}
+\label{fig:targeted-adaptation}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\caption{Adaptation latency across policy sizes (ms), $|\mathbb{S}|=60$.}
+\scriptsize
+\TableStyle
+\resizebox{\textwidth}{!}{\input{../targeted_tables/tables/table3_adaptation_latency.tex}}
+\label{tab:targeted-adaptation}
+\end{table*}
+
+\subsection{Hash-check Benefit}
+We also isolate the user-side benefit of the final hash-check trick. The strict legacy comparison now measures a full re-encryption-based finalize path rather than the earlier lightweight AES-only check.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.84\textwidth]{../targeted_tables/figures/hashcheck_vs_reenc.pdf}
+\caption{Full re-encryption finalization versus hash-check finalization.}
+\label{fig:targeted-hashcheck}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\caption{User-side finalization comparison (ms).}
+\scriptsize
+\TableStyle
+\resizebox{\textwidth}{!}{\input{../targeted_tables/tables/table_hashcheck.tex}}
+\label{tab:targeted-hashcheck}
+\end{table*}
+
+\subsection{Revocation Comparison}
+For revocation, we compare only with server-assisted revocation designs, namely EHR-RPCH and TAR-PCH, together with our TEE-RPCH state-signing and TEE-check path.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.84\textwidth]{../targeted_tables/figures/revocation_comparison.pdf}
+\caption{Revocation cost for one modifier on MNT224 and A1.}
+\label{fig:targeted-revocation}
+\end{figure*}
+
+\begin{table*}[t]
+\centering
+\caption{Revocation cost for one revoked modifier (ms).}
+\scriptsize
+\TableStyleTight
+\resizebox{\textwidth}{!}{\input{../targeted_tables/tables/table4_revocation.tex}}
+\label{tab:targeted-revocation}
+\end{table*}
+
+\FloatBarrier

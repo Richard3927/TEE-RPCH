@@ -1,0 +1,88 @@
+{
+  "params": {
+    "curve": "a1",
+    "bench_version": "rpch-baselines-v9-ehr-tar-revocation",
+    "rsa_bits": 3072,
+    "users": 1024,
+    "attrs": 40,
+    "policy_attrs": 20
+  },
+  "schemes": {
+    "PCH_DSS_2019": {
+      "times_ms": {
+        "Forge": 24524.8,
+        "Hash": 22902.1,
+        "KG": 5995.23,
+        "PG": 943.862
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 17057,
+        "hash_bytes": 1152,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_XNM_2021": {
+      "times_ms": {
+        "DKGen": 31.271,
+        "Forge": 24637.8,
+        "Hash": 22650.8,
+        "KG": 5974.59,
+        "KUpt(revoked)": 314.436,
+        "KUpt(valid)": 31.43,
+        "PG": 2285.7,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 17317,
+        "hash_bytes": 1152,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 767,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_TMM_2022": {
+      "times_ms": {
+        "DKGen": 0.082,
+        "Forge": 24427.9,
+        "Hash": 22515.5,
+        "KG": 5963.18,
+        "KUpt(revoked)": 312.97,
+        "KUpt(valid)": 31.191,
+        "PG": 138.159,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 16768,
+        "hash_bytes": 520,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 128,
+        "verify_ok": 1
+      }
+    },
+    "JMC_KH_2024_Lattice_RPCH": {
+      "times_ms": {
+        "Forge": 315.397,
+        "Hash": 516.536,
+        "KG": 372.53,
+        "PG": 91.871
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 171872,
+        "hash_bytes": 2496,
+        "lattice_lambda": 192,
+        "lattice_m": 7040,
+        "lattice_m0": 6144,
+        "lattice_n": 384,
+        "lattice_q_bits": 17,
+        "lattice_security_bits": 192,
+        "mpk_bytes": 16591872,
+        "msk_seed_bytes": 8206848,
+        "rand_bytes": 46704,
+        "verify_ok": 1
+      }
+    }
+  }
+}

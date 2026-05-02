@@ -1,0 +1,116 @@
+{
+  "params": {
+    "curve": "a1",
+    "bench_version": "rpch-baselines-v10-ehr-tar-full-revocation-split",
+    "rsa_bits": 3072,
+    "users": 65536,
+    "attrs": 60,
+    "policy_attrs": 20
+  },
+  "schemes": {
+    "PCH_DSS_2019": {
+      "times_ms": {
+        "KG": 8945.43,
+        "PG": 650.061
+      },
+      "sizes_bytes": {
+
+      }
+    },
+    "RPCH_XNM_2021": {
+      "times_ms": {
+        "KG": 8945.74,
+        "KUpt(revoked)": 519.951,
+        "KUpt(valid)": 36.229,
+        "PG": 1621.53,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "ku_theta_nodes(revoked)": 16,
+        "ku_theta_nodes(valid)": 1
+      }
+    },
+    "RPCH_TMM_2022": {
+      "times_ms": {
+        "KG": 9007.47,
+        "KUpt(revoked)": 517.348,
+        "KUpt(valid)": 36.465,
+        "PG": 188.327,
+        "Rev": 0
+      },
+      "sizes_bytes": {
+        "ku_theta_nodes(revoked)": 16,
+        "ku_theta_nodes(valid)": 1
+      }
+    },
+    "EHR_RPCH": {
+      "times_ms": {
+        "Adapt": 4043.68,
+        "Assign": 68.147,
+        "Assign(pre-authorize)": 79.559,
+        "CheckInt": 0,
+        "EtdRevoke": 45663.2,
+        "EtdRevoke.CSP": 45595.1,
+        "EtdRevoke.KGC": 68.147,
+        "EtdRevoke.KGC.Assign": 0,
+        "EtdRevoke.KGC.DKGen": 31.752,
+        "EtdRevoke.KGC.KUpt": 36.395,
+        "HashAndEnc": 46077,
+        "KeyGen": 18067.6,
+        "ReAdapt": 4120.77,
+        "Setup": 668.433
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 34634,
+        "hash_bytes": 1152,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "TAR_PCH": {
+      "times_ms": {
+        "Adapt": 2041.98,
+        "Assign(pre-authorize)": 36.727,
+        "CTUpdate.CSP": 3144.63,
+        "Hash": 23028.5,
+        "KEKUpdate.CSP": 139.663,
+        "KeyGen": 12719,
+        "KeySanityCheck.AA": 5427.53,
+        "ReHash.CSP": 24534.3,
+        "Revocation": 39493,
+        "Revocation.CSP": 27818.6,
+        "Revocation.KGC": 11674.4,
+        "Setup": 2103.07,
+        "UserTrace.AA": 6246.86
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 16768,
+        "hash_bytes": 520,
+        "rand_bytes": 128,
+        "tar_key_sanity_ok": 1,
+        "verify_ok": 1
+      }
+    },
+    "JMC_KH_2024_Lattice_RPCH": {
+      "times_ms": {
+        "KG": 412.984,
+        "KUpt(revoked)": 881.569,
+        "KUpt(valid)": 12.091,
+        "PG": 110.584,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "ku_theta_nodes(revoked)": 16,
+        "ku_theta_nodes(valid)": 1,
+        "lattice_lambda": 192,
+        "lattice_m": 7040,
+        "lattice_m0": 6144,
+        "lattice_n": 384,
+        "lattice_q_bits": 17,
+        "lattice_security_bits": 192,
+        "mpk_bytes": 16592512,
+        "msk_seed_bytes": 8218368
+      }
+    }
+  }
+}

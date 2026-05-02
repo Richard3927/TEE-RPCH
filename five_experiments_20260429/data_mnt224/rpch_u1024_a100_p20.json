@@ -1,0 +1,88 @@
+{
+  "params": {
+    "curve": "mnt224",
+    "bench_version": "rpch-baselines-v9-ehr-tar-revocation",
+    "rsa_bits": 3072,
+    "users": 1024,
+    "attrs": 100,
+    "policy_attrs": 20
+  },
+  "schemes": {
+    "PCH_DSS_2019": {
+      "times_ms": {
+        "Forge": 1234.75,
+        "Hash": 1507.77,
+        "KG": 708.772,
+        "PG": 3156.55
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 4449,
+        "hash_bytes": 1152,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_XNM_2021": {
+      "times_ms": {
+        "DKGen": 6.084,
+        "Forge": 1248.83,
+        "Hash": 1328.56,
+        "KG": 713.644,
+        "KUpt(revoked)": 59.67,
+        "KUpt(valid)": 6.063,
+        "PG": 599.859,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 4505,
+        "hash_bytes": 1152,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_TMM_2022": {
+      "times_ms": {
+        "DKGen": 0.087,
+        "Forge": 1208.46,
+        "Hash": 1102.2,
+        "KG": 715.015,
+        "KUpt(revoked)": 59.637,
+        "KUpt(valid)": 6.039,
+        "PG": 30.726,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 3948,
+        "hash_bytes": 112,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 28,
+        "verify_ok": 1
+      }
+    },
+    "JMC_KH_2024_Lattice_RPCH": {
+      "times_ms": {
+        "Forge": 187.695,
+        "Hash": 307.81,
+        "KG": 300.678,
+        "PG": 60.238
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 67402,
+        "hash_bytes": 1152,
+        "lattice_lambda": 128,
+        "lattice_m": 4096,
+        "lattice_m0": 3584,
+        "lattice_n": 256,
+        "lattice_q_bits": 14,
+        "lattice_security_bits": 128,
+        "mpk_bytes": 4526336,
+        "msk_seed_bytes": 2263424,
+        "rand_bytes": 20768,
+        "verify_ok": 1
+      }
+    }
+  }
+}

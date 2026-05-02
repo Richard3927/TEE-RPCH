@@ -1,7 +1,7 @@
 # Baseline Benchmarks (RPCH-XNM'21 / RPCH-TMM'22)
 
 This directory builds a small benchmark tool that generates baseline timing data for prior work
-(XNM'21 / TMM'22), which is used by the TEE-RPCH plotting scripts.
+(XNM'21 / TMM'22), which is used by the TR-PCH plotting scripts.
 
 ## Build
 
@@ -9,7 +9,7 @@ The Makefile expects the pairing/ABE helper library under `../CH_PBC_example-mai
 If that dependency is missing in your snapshot, rebuilding will fail until you restore it.
 
 ```bash
-cd rpch_bench
+cd TR-PCH/HR-PCH/rpch_bench
 make clean
 make -j"$(nproc)"
 ```

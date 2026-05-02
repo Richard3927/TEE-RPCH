@@ -1,0 +1,168 @@
+\PassOptionsToPackage{table}{xcolor}
+\documentclass[sigconf]{acmart} %% CCS: DO NOT REMOVE
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{%
+    Bib\TeX}}}
+
+\setcopyright{acmlicensed} %% CCS: DO NOT REMOVE
+\copyrightyear{2018} %% CCS: DO NOT REMOVE
+\acmYear{2018} %% CCS: DO NOT REMOVE
+\acmDOI{XXXXXXX.XXXXXXX} %% CCS: DO NOT REMOVE
+\acmConference[Conference acronym 'XX]{Make sure to enter the correct
+  conference title from your rights confirmation email}{June 03--05,
+  2018}{Woodstock, NY} %% CCS: DO NOT REMOVE
+\acmISBN{978-1-4503-XXXX-X/2018/06} %% CCS: DO NOT REMOVE
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\usepackage{amsmath}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{mathrsfs}
+\usepackage{pifont}
+\usepackage{tcolorbox}
+\usepackage{tikz}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{balance}
+\usepackage{placeins}
+\usepackage{stfloats}
+
+\usetikzlibrary{shapes,arrows,positioning,calc,fit,backgrounds}
+
+\usepackage{cryptodef}
+\setlength{\emergencystretch}{2em}
+\flushbottom
+
+% Unified visual style for algorithm/construction boxes and tables.
+\tcbset{
+  algobox/.style={
+    colback=white,
+    colframe=black,
+    colbacktitle=gray!10,
+    coltitle=black,
+    fonttitle=\scriptsize\bfseries,
+    boxrule=0.7pt,
+    arc=0mm,
+    toptitle=0.45mm,
+    bottomtitle=0.45mm,
+    titlerule=0.4pt,
+    left=0.9mm, right=0.9mm, top=0.45mm, bottom=0.55mm,
+    boxsep=0pt,
+    before skip=2pt,
+    after skip=2pt,
+    before upper={%
+      \setlength{\abovedisplayskip}{1.2pt plus 0.5pt minus 0.5pt}%
+      \setlength{\belowdisplayskip}{1.2pt plus 0.5pt minus 0.5pt}%
+      \setlength{\abovedisplayshortskip}{0.8pt plus 0.5pt minus 0.5pt}%
+      \setlength{\belowdisplayshortskip}{0.8pt plus 0.5pt minus 0.5pt}%
+      \setlength{\jot}{0.5pt}%
+    }
+  }
+}
+\newcommand{\TableStyle}{\setlength{\tabcolsep}{3pt}\renewcommand{\arraystretch}{1.06}}
+\newcommand{\TableStyleTight}{\setlength{\tabcolsep}{2.6pt}\renewcommand{\arraystretch}{1.03}}
+
+\newif\ifsubmission
+\ifdefined\submissionbuild
+  \submissiontrue
+\else
+  \submissionfalse
+\fi
+
+\setlength{\textfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\floatsep}{4pt plus 1pt minus 1pt}
+\setlength{\intextsep}{4pt plus 1pt minus 1pt}
+\setlength{\dbltextfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\dblfloatsep}{4pt plus 1pt minus 1pt}
+\setlength{\abovecaptionskip}{2pt}
+\setlength{\belowcaptionskip}{0pt}
+\setlength{\abovedisplayskip}{3pt plus 1pt minus 1pt}
+\setlength{\belowdisplayskip}{3pt plus 1pt minus 1pt}
+\setlength{\abovedisplayshortskip}{2pt plus 1pt minus 1pt}
+\setlength{\belowdisplayshortskip}{2pt plus 1pt minus 1pt}
+\setlength{\jot}{1pt}
+\setlist[itemize]{leftmargin=*,topsep=1pt,itemsep=1pt,parsep=0pt,partopsep=0pt}
+\setlist[enumerate]{leftmargin=*,topsep=1pt,itemsep=1pt,parsep=0pt,partopsep=0pt}
+\renewcommand{\topfraction}{0.98}
+\renewcommand{\dbltopfraction}{0.98}
+\renewcommand{\bottomfraction}{0.9}
+\renewcommand{\textfraction}{0.01}
+\renewcommand{\floatpagefraction}{0.55}
+\renewcommand{\dblfloatpagefraction}{0.55}
+\setcounter{topnumber}{4}
+\setcounter{bottomnumber}{2}
+\setcounter{dbltopnumber}{3}
+\setcounter{totalnumber}{6}
+
+\begin{document}
+
+\title[TEE-RPCH]{TEE-RPCH: Revocable Policy-based Chameleon Hashes via Trusted Execution Environments} %% CCS: you MUST provide a title
+
+%% CCS: at submission time, the submission MUST be anonymized. Hence
+%% authors MUST be commented out.
+% \author{Anonymous Author(s)}
+% \affiliation{%
+%   \institution{Anonymous Institution}
+%   \country{}
+% }
+
+\renewcommand{\shortauthors}{Anonymous}
+
+\begin{abstract}
+\input{sections/abstract}
+\end{abstract}
+
+\begin{CCSXML} %% CCS: DO NOT REMOVE this part. You MAY update the concepts.
+<ccs2012>
+ <concept>
+  <concept_id>10002978.10002991</concept_id>
+  <concept_desc>Security and privacy~Cryptography</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10002978.10003014.10003016</concept_id>
+  <concept_desc>Security and privacy~Trusted computing</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Security and privacy~Cryptography}
+\ccsdesc[300]{Security and privacy~Trusted computing}
+
+\keywords{trusted execution environment, chameleon hash, revocation, policy-based cryptography}
+
+\maketitle
+
+\input{sections/intro}
+\input{sections/preliminaries}
+\input{sections/pch2oa}
+\input{sections/tee-rpch}
+\input{sections/evaluation}
+\input{sections/conclusion}
+% \input{sections/backmatter}
+
+\FloatBarrier
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{reference}
+
+\FloatBarrier
+\appendix %% CCS: DO NOT REMOVE
+
+\section{Open Science} %% CCS: DO NOT REMOVE
+
+The artifacts needed to evaluate the experimental claims of this paper include the TEE-RPCH implementation, benchmark scripts, plotting scripts, configuration files, and raw timing logs. These artifacts will be provided to the program committee through an anonymous artifact package for double-blind review. No external user data or proprietary datasets are required to reproduce the reported cryptographic and systems measurements.
+
+\section{Ethical Considerations}
+
+This work studies a cryptographic primitive and its TEE-assisted revocation mechanism. It does not involve human subjects, user data, or real-world vulnerability disclosure. The main security risk is misuse of redactable mechanisms to perform unauthorized history modification; our construction is designed to restrict rewriting to authorized modifiers and to support revocation of such privileges.
+
+\input{sections/appendix}
+
+\end{document}

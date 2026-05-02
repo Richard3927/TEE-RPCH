@@ -1,0 +1,88 @@
+{
+  "params": {
+    "curve": "a1",
+    "bench_version": "rpch-baselines-v9-ehr-tar-revocation",
+    "rsa_bits": 3072,
+    "users": 1024,
+    "attrs": 60,
+    "policy_attrs": 40
+  },
+  "schemes": {
+    "PCH_DSS_2019": {
+      "times_ms": {
+        "Forge": 88695.4,
+        "Hash": 85361.2,
+        "KG": 8906.26,
+        "PG": 577.623
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 32657,
+        "hash_bytes": 1152,
+        "rand_bytes": 768,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_XNM_2021": {
+      "times_ms": {
+        "DKGen": 31.565,
+        "Forge": 88702.5,
+        "Hash": 85066.9,
+        "KG": 8861.19,
+        "KUpt(revoked)": 314.716,
+        "KUpt(valid)": 31.292,
+        "PG": 3820.1,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 32917,
+        "hash_bytes": 1151,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 767,
+        "verify_ok": 1
+      }
+    },
+    "RPCH_TMM_2022": {
+      "times_ms": {
+        "DKGen": 0.102,
+        "Forge": 88210.4,
+        "Hash": 84620.8,
+        "KG": 8862.8,
+        "KUpt(revoked)": 312.733,
+        "KUpt(valid)": 31.239,
+        "PG": 138.314,
+        "Rev": 0.001
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 32368,
+        "hash_bytes": 520,
+        "ku_theta_nodes(revoked)": 10,
+        "ku_theta_nodes(valid)": 1,
+        "rand_bytes": 128,
+        "verify_ok": 1
+      }
+    },
+    "JMC_KH_2024_Lattice_RPCH": {
+      "times_ms": {
+        "Forge": 481.659,
+        "Hash": 752.072,
+        "KG": 410.605,
+        "PG": 92.025
+      },
+      "sizes_bytes": {
+        "cipher_bytes": 295328,
+        "hash_bytes": 2496,
+        "lattice_lambda": 192,
+        "lattice_m": 7040,
+        "lattice_m0": 6144,
+        "lattice_n": 384,
+        "lattice_q_bits": 17,
+        "lattice_security_bits": 192,
+        "mpk_bytes": 16592640,
+        "msk_seed_bytes": 8218368,
+        "rand_bytes": 46704,
+        "verify_ok": 1
+      }
+    }
+  }
+}
